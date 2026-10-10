@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import random
 from datetime import datetime, timedelta, timezone
 
@@ -35,6 +36,21 @@ class MockAdapter(Adapter):
             ev = Event(book=self.book, sport=sport, home=names[0], away=names[1],
                        start=now + timedelta(hours=5 + i), league="Mock League",
                        url=f"https://example.com/{self.book}/{i}", event_id=str(i))
-            ev.markets[mkt] = {k: Price(odds=v, limit=rnd.choice([200, 500, 1000])) for k, v in sides.items()}
+            ev.markets[mkt] = {k: Price(odds=v, limit=rnd.choice([200, 500, 1000]), ref=f"{self.book}:{i}:{k}",
+                                        market_ref=f"{self.book}:{i}") for k, v in sides.items()}
             out.append(ev)
         return out
+
+    @property
+    def streaming(self) -> bool:
+        return bool(self.cfg.get("websocket", True))
+
+    async def stream(self, watched, on_update):
+        """Simulated live feed: random small price moves several times a second."""
+        rnd = random.Random()
+        while True:
+            await asyncio.sleep(rnd.uniform(0.2, 1.0))
+            prices = watched()
+            if prices:
+                p = rnd.choice(prices)
+                on_update({p.ref: (round(max(1.01, p.odds * rnd.uniform(0.97, 1.03)), 2), None, p.limit)})

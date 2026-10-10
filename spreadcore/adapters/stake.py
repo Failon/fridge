@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 
 from ..models import Event
@@ -28,6 +29,14 @@ query SportFixtureList($type: SportSearchEnum!, $sport: String!, $groups: String
       }
     }
   }
+}
+"""
+
+# Live odds: GraphQL subscription per market over graphql-transport-ws. Override `ws_query` in
+# config with the subscription Stake's frontend sends (DevTools -> Network -> WS -> _api/websockets).
+WS_QUERY = """
+subscription SportMarket($id: String!) {
+  sportMarket(id: $id) { id status outcomes { id active odds } }
 }
 """
 
@@ -98,5 +107,94 @@ class StakeAdapter(Adapter):
                         continue
                     mapped = map_outcomes(items, ev.home, ev.away)
                     if mapped and mapped[0] not in ev.markets:
+                        for price in mapped[1].values():
+                            price.market_ref = m.get("id")
                         ev.markets[mapped[0]] = mapped[1]
         return ev if ev.markets else None
+
+    # ---- live odds over websocket ---------------------------------------------------------
+
+    @property
+    def streaming(self) -> bool:
+        return bool(self.cfg.get("websocket", True))
+
+    async def stream(self, watched, on_update):
+        delay = 1
+        while True:
+            try:
+                await self._ws_session(watched, on_update)
+                delay = 1
+            except asyncio.CancelledError:
+                raise
+            except _Unsupported as e:
+                log.warning("stake ws disabled (%s); falling back to polling every %ss", e,
+                            self.cfg.get("interval", "scan.interval"))
+                return
+            except Exception as e:  # noqa: BLE001
+                log.warning("stake ws: %s, reconnect in %ds", e, delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
+
+    async def _ws_session(self, watched, on_update):
+        ws = await self.ws_connect(self.cfg.get("ws_url", f"wss://{self.domain}/_api/websockets"),
+                                   headers={"Sec-WebSocket-Protocol": "graphql-transport-ws"})
+        init = {"language": "en"}
+        if self.cfg.get("access_token"):
+            init["accessToken"] = self.cfg["access_token"]
+        await ws.send_json({"type": "connection_init", "payload": init})
+        query = self.cfg.get("ws_query", WS_QUERY)
+        subscribed: set[str] = set()
+        ok = errors = 0
+        reader = asyncio.create_task(ws.recv_str())
+        while True:
+            for mid in {p.market_ref for p in watched() if p.market_ref} - subscribed:
+                subscribed.add(mid)
+                await ws.send_json({"id": mid, "type": "subscribe",
+                                    "payload": {"query": query, "variables": {"id": mid}}})
+            done, _ = await asyncio.wait({reader}, timeout=3)
+            if not done:
+                continue
+            msg = json.loads(reader.result())
+            reader = asyncio.create_task(ws.recv_str())
+            typ = msg.get("type")
+            if typ == "ping":
+                await ws.send_json({"type": "pong"})
+            elif typ == "next":
+                ok += 1
+                upd = self.handle_ws(msg.get("payload") or {})
+                if upd:
+                    on_update(upd)
+            elif typ == "error":
+                errors += 1
+                subscribed.discard(msg.get("id"))
+                if ok == 0 and errors >= 3:
+                    reader.cancel()
+                    raise _Unsupported(f"subscription rejected: {str(msg.get('payload'))[:200]}")
+            elif typ == "complete":
+                subscribed.discard(msg.get("id"))
+
+    @staticmethod
+    def handle_ws(payload: dict) -> dict:
+        """Find markets with outcomes anywhere in payload.data; return {outcome_id: (odds, None, None)}."""
+        out = {}
+
+        def walk(node, active=True):
+            if isinstance(node, dict):
+                if isinstance(node.get("outcomes"), list):
+                    m_active = active and node.get("status") in (None, "active")
+                    for o in node["outcomes"]:
+                        if isinstance(o, dict) and o.get("id"):
+                            odds = as_float(o.get("odds")) if m_active and o.get("active", True) else None
+                            out[o["id"]] = (odds, None, None)
+                for v in node.values():
+                    walk(v, active)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v, active)
+
+        walk(payload.get("data"))
+        return out
+
+
+class _Unsupported(Exception):
+    pass

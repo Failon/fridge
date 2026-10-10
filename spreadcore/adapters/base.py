@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
+from typing import Callable
 
-from ..models import Event
+from ..models import Event, Price
 
 log = logging.getLogger("spreadcore")
 
@@ -85,6 +86,19 @@ class Adapter:
 
     async def fetch(self) -> list[Event]:
         raise NotImplementedError
+
+    @property
+    def streaming(self) -> bool:
+        """True if this adapter pushes live price updates via `stream()`."""
+        return False
+
+    async def stream(self, watched: Callable[[], list[Price]], on_update: Callable[[dict], None]):
+        """Run forever, calling on_update({ref: (odds, raw, limit)}) for prices returned by watched()."""
+        raise NotImplementedError
+
+    async def ws_connect(self, url: str, **kw):
+        s = await self.session()
+        return await s.ws_connect(url, **kw)
 
     async def close(self):
         if self._session is not None:

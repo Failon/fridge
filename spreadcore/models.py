@@ -16,6 +16,8 @@ class Price:
     raw: float | None = None    # source price (e.g. Polymarket probability)
     limit: float | None = None  # max stake/liquidity in USD, if known
     ref: str | None = None      # source-specific id (token id, outcome id)
+    market_ref: str | None = None  # id of the market this outcome belongs to (for subscriptions)
+    live: bool = False          # last updated from a websocket stream
 
 
 @dataclass

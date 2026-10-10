@@ -10,6 +10,7 @@ from .base import Adapter, as_float, log, parse_time
 
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
+WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 # our sport slug -> Polymarket tag slugs
 DEFAULT_TAGS = {
@@ -147,3 +148,98 @@ class PolymarketAdapter(Adapter):
         price = min(p for p, _ in asks)
         usd = sum(p * s for p, s in asks if p <= price + 1e-9)
         return price, usd
+
+    # ---- live order book over websocket -------------------------------------------------
+
+    @property
+    def streaming(self) -> bool:
+        return bool(self.cfg.get("websocket", True))
+
+    async def stream(self, watched, on_update):
+        """Keep one websocket per shard of tokens; open new shards as new matches appear."""
+        self.asks: dict[str, dict[float, float]] = {}
+        size = int(self.cfg.get("ws_shard_size", 400))
+        shards: dict[asyncio.Task, set[str]] = {}
+        while True:
+            want = {p.ref for p in watched() if p.ref}
+            for t, toks in list(shards.items()):
+                if t.done() or not toks & want:  # nothing left to watch on this socket
+                    t.cancel()
+                    del shards[t]
+            have = set().union(*shards.values()) if shards else set()
+            new = sorted(want - have)
+            for i in range(0, len(new), size):
+                toks = set(new[i:i + size])
+                shards[asyncio.create_task(self._shard(toks, on_update))] = toks
+            await asyncio.sleep(3)
+
+    async def _shard(self, tokens: set[str], on_update):
+        delay = 1
+        while True:
+            ping = None
+            try:
+                ws = await self.ws_connect(self.cfg.get("ws_url", WS_URL))
+                await ws.send_json({"assets_ids": sorted(tokens), "type": "market"})
+                log.info("polymarket ws: subscribed %d tokens", len(tokens))
+                ping = asyncio.create_task(self._ping(ws))
+                delay = 1
+                while True:
+                    msg = await ws.recv_str()
+                    if not msg or msg in ("PONG", "pong"):
+                        continue
+                    data = json.loads(msg)
+                    for m in data if isinstance(data, list) else [data]:
+                        upd = self.handle_ws(m)
+                        if upd:
+                            on_update(upd)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.warning("polymarket ws: %s, reconnect in %ds", e, delay)
+            finally:
+                if ping:
+                    ping.cancel()
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30)
+
+    @staticmethod
+    async def _ping(ws):
+        while True:
+            await asyncio.sleep(10)
+            await ws.send_str("PING")
+
+    def handle_ws(self, m: dict) -> dict:
+        """Apply a market-channel message to local books; return {token: (odds, ask, usd)}."""
+        if not hasattr(self, "asks"):
+            self.asks = {}
+        kind = m.get("event_type")
+        touched: dict[str, float | None] = {}
+        if kind == "book":
+            aid = m.get("asset_id")
+            levels = m.get("asks") or m.get("sells") or []
+            self.asks[aid] = {float(l["price"]): float(l["size"]) for l in levels if float(l["size"]) > 0}
+            touched[aid] = None
+        elif kind == "price_change":
+            changes = m.get("price_changes") or [{**c, "asset_id": m.get("asset_id")} for c in m.get("changes", [])]
+            for c in changes:
+                aid = c.get("asset_id")
+                if str(c.get("side", "")).upper() == "SELL" and aid in self.asks:
+                    price, size = float(c["price"]), float(c["size"])
+                    if size > 0:
+                        self.asks[aid][price] = size
+                    else:
+                        self.asks[aid].pop(price, None)
+                touched[aid] = as_float(c.get("best_ask"))
+        elif kind == "best_bid_ask":
+            touched[m.get("asset_id")] = as_float(m.get("best_ask"))
+        out = {}
+        for aid, best in touched.items():
+            book = self.asks.get(aid)
+            if book:
+                ask = min(book)
+                out[aid] = (self.odds(ask), ask, ask * book[ask])
+            elif best:  # no snapshot yet, only top of book
+                out[aid] = (self.odds(best), best, None)
+            elif book is not None:  # empty book: nothing to buy
+                out[aid] = (None, None, None)
+        return out

@@ -19,7 +19,7 @@ def find_arbs(group: list[Event], bankroll: float = 100.0, min_profit: float = 0
         best = []
         for out in outcomes:
             cands = [(e, e.markets[market][out]) for e in group
-                     if market in e.markets and out in e.markets[market]]
+                     if market in e.markets and out in e.markets[market] and e.markets[market][out].odds > 1]
             if not cands:
                 break
             best.append((out, *max(cands, key=lambda c: c[1].odds)))
