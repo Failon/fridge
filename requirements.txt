@@ -1,0 +1,6 @@
+curl_cffi>=0.7
+pyyaml>=6.0
+rapidfuzz>=3.0
+fastapi>=0.110
+uvicorn>=0.29
+pytest>=8.0
