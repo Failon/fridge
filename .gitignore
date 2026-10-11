@@ -5,3 +5,5 @@ __pycache__/
 .env
 .idea/
 .vscode/
+config.yaml
+captures/

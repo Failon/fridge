@@ -1,0 +1,73 @@
+# Скопируйте в config.yaml и заполните.
+scan:
+  mode: polymarket          # polymarket = только вилки БК vs Polymarket (как SpreadCore); all = ещё и БК vs БК
+  interval: 15              # опрос REST по умолчанию (поиск новых матчей); цены дальше идут по WebSocket
+  bankroll: 100             # банк для расчёта ставок, $
+  min_profit: 0.5           # минимальный % вилки
+  max_profit: 15            # выше — почти всегда ошибка сопоставления, отбрасываем
+  verify_polymarket: true   # если WS Polymarket недоступен — перепроверять цену по REST-стакану перед алертом
+  match_threshold: 86       # строгость fuzzy-сопоставления команд (0-100)
+  time_window_hours: 3      # макс. разница времени начала матча между источниками
+  sports: [soccer, basketball, ice-hockey, tennis, mma, counter-strike]
+
+telegram:                   # или переменные окружения TG_BOT_TOKEN / TG_CHAT_ID
+  bot_token: ""
+  chat_id: ""
+  cooldown: 600             # не повторять ту же вилку чаще (сек), если % не вырос на 0.5+
+
+books:
+  polymarket:
+    type: polymarket
+    taker_fee: 0.0          # доля комиссии с выплаты, если на рынке есть taker fee
+    websocket: true         # живой стакан wss://ws-subscriptions-clob.polymarket.com (только сматченные рынки)
+    interval: 30            # REST Gamma — только чтобы находить новые матчи
+
+  stake:
+    type: stake
+    domain: stake.com       # или зеркало: stake.bet, stake.ac ...
+    group: winner
+    types: [upcoming, live]
+    pages: 4
+    websocket: true         # GraphQL-подписки wss://<домен>/_api/websockets; при отказе — откат на опрос
+    interval: 20            # REST — поиск новых матчей (без WS ставьте 3-5)
+    # ws_query: |           # если дефолтная подписка не подходит — скопируйте из DevTools -> WS
+    #   subscription SportMarket($id: String!) { sportMarket(id: $id) { id status outcomes { id active odds } } }
+    # Если ловите 403 от Cloudflare: возьмите cookie (cf_clearance, __cf_bm) и User-Agent
+    # из того же браузера (DevTools -> Network -> запрос graphql) и вставьте сюда:
+    # cookies: "cf_clearance=...; __cf_bm=..."
+    # headers: {user-agent: "Mozilla/5.0 ..."}
+    # proxy: "http://user:pass@host:port"   # IP из разрешённой для Stake страны
+
+  goated:
+    # Запустите: python -m spreadcore.discover https://www.goated.com/sports
+    # Если увидите строку [Betby] — вставьте api и brand_id. Иначе используйте type: jsonmap (как у parimatch).
+    type: betby
+    enabled: false
+    api: "https://api-XXXX.sptpub.com"
+    brand_id: "0000000000000000000"
+    site_url: "https://www.goated.com/sports"
+    interval: 3             # нет WS — частый опрос
+
+  parimatch:
+    # Generic JSON-адаптер. Эндпоинт и пути к полям берутся из captures/endpoints.json после discover.
+    type: jsonmap
+    enabled: false
+    interval: 3             # нет WS — частый опрос
+    request:
+      url: "https://<домен parimatch>/<путь к линии>"
+      method: GET
+    events: "events[*]"          # путь к списку матчей ([*] — все элементы, .* — все значения словаря)
+    sport: "sport.name"          # или sport_fixed: soccer
+    sport_map: {Football: soccer, Basketball: basketball, "Ice Hockey": ice-hockey, Tennis: tennis}
+    home: "competitors[0].name"
+    away: "competitors[1].name"
+    start: "startTime"           # unix (сек/мс) или ISO
+    league: "tournament.name"
+    id: "id"
+    url_template: "https://<домен parimatch>/events/{id}"
+    markets:
+      - path: "markets[*]"
+        where: {type: "1x2"}     # фильтр по полям рынка
+        outcomes: "outcomes[*]"
+        outcome_name: "name"     # имя команды, или 1/X/2, или W1/W2
+        odds: "price"            # десятичный коэф (odds_format: american — для американских)
