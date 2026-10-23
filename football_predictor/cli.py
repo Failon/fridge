@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import data
+from . import data, transfermarkt, understat
 from .features import build_features
 from .metrics import report
 from .model import MatchPredictor
@@ -23,7 +23,8 @@ MODEL_PATH = Path(os.environ.get("FOOTBALL_MODEL_PATH", "models/predictor.pkl"))
 def _load_features(args):
     """Матчи + признаки + состояние движка (кэшируется, т.к. проход по истории занимает минуты)."""
     matches = data.load_matches(args.data_dir, args.extra_csv)
-    key = (len(matches), str(matches["date"].max()), tuple(args.extra_csv or []))
+    key = (len(matches), str(matches["date"].max()), int(matches["hxg"].notna().sum()),
+           int(matches["h_value"].notna().sum()) if "h_value" in matches else 0, tuple(args.extra_csv or []))
     if FEATURES_CACHE.exists() and not args.rebuild:
         with open(FEATURES_CACHE, "rb") as f:
             cached = pickle.load(f)
@@ -48,6 +49,12 @@ def _filter(matches, X, args):
 
 def cmd_download(args):
     data.download(args.leagues or data.LEAGUES, args.first, args.last, args.data_dir, args.force)
+    if not args.no_xg:
+        print("xG с understat.com...")
+        understat.download(args.leagues or data.LEAGUES, force=args.force)
+    if not args.no_tm:
+        print("Составы и стоимость игроков (transfermarkt-datasets)...")
+        transfermarkt.download(force=args.force)
 
 
 def cmd_backtest(args):
@@ -196,6 +203,8 @@ def main(argv=None):
     p.add_argument("--first", type=int, default=data.FIRST_SEASON)
     p.add_argument("--last", type=int, default=data.LAST_SEASON)
     p.add_argument("--force", action="store_true")
+    p.add_argument("--no-xg", action="store_true", help="не качать xG с understat.com")
+    p.add_argument("--no-tm", action="store_true", help="не качать данные Transfermarkt (~60 МБ)")
     p.set_defaults(func=cmd_download)
 
     p = add("backtest", "честная walk-forward проверка по сезонам")

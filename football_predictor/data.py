@@ -162,7 +162,11 @@ def fetch_fixtures() -> pd.DataFrame:
     return out.dropna(subset=["date"]).sort_values(["date", "time", "league"]).reset_index(drop=True)
 
 
-def load_matches(cache_dir="data/raw", extra_csv: list[str] | None = None) -> pd.DataFrame:
+def load_matches(cache_dir="data/raw", extra_csv: list[str] | None = None,
+                 understat_dir: str | None = "data/understat",
+                 transfermarkt_dir: str | None = "data/transfermarkt") -> pd.DataFrame:
+    """Все матчи; если скачаны Understat и Transfermarkt — с xG (с 2014/15),
+    стоимостью составов и тренерами (с 2012/13)."""
     frames = []
     for path in sorted(Path(cache_dir).glob("*.csv")):
         league, code = path.stem.rsplit("_", 1)
@@ -181,4 +185,11 @@ def load_matches(cache_dir="data/raw", extra_csv: list[str] | None = None) -> pd
             .drop_duplicates(["date", "league", "home", "away"], keep="last")
             .drop(columns="_has_odds"))
     df["result"] = np.select([df.hg > df.ag, df.hg == df.ag], [0, 1], 2)  # 0=П1, 1=X, 2=П2
-    return df.sort_values(["date", "league", "home"]).reset_index(drop=True)
+    df = df.sort_values(["date", "league", "home"]).reset_index(drop=True)
+    if understat_dir and Path(understat_dir).exists():
+        from .understat import attach_xg
+        df = attach_xg(df, understat_dir)
+    if transfermarkt_dir and (Path(transfermarkt_dir) / "games.csv.gz").exists():
+        from .transfermarkt import attach
+        df = attach(df, transfermarkt_dir)
+    return df

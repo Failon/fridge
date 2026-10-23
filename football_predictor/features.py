@@ -7,8 +7,10 @@
 Признаки:
   * Elo с поправкой на разницу мячей и откатом к среднему между сезонами;
   * pi-ratings (Constantinou & Fenton, 2013) — раздельные домашний/гостевой рейтинги;
-  * Диксон–Коулз с затуханием по времени (переобучается раз в неделю на каждую лигу);
-  * экспоненциально сглаженная форма (быстрая и медленная): голы, удары, удары в створ,
+  * Диксон–Коулз с затуханием по времени (переобучается раз в неделю на каждую лигу) —
+    по голам и отдельно по xG (xG меньше зависят от везения);
+  * стоимость вышедшего состава (EWMA, Transfermarkt) и стаж тренера;
+  * экспоненциально сглаженная форма (быстрая и медленная): голы, xG, удары, удары в створ,
     угловые, очки; отдых, опыт в лиге, признак новичка;
   * рыночные вероятности из коэффициентов (если они есть в данных).
 """
@@ -23,7 +25,8 @@ import pandas as pd
 from .data import season_of
 from .dixon_coles import DixonColes
 
-FORM_STATS = ["gf", "ga", "sf", "sa", "stf", "sta", "cf", "ca", "pts"]
+# lval — log стоимости вышедшего состава (Transfermarkt), остальное — «за/против» в матче
+FORM_STATS = ["gf", "ga", "xgf", "xga", "sf", "sa", "stf", "sta", "cf", "ca", "pts", "lval"]
 ALPHAS = {"fast": 0.25, "slow": 0.07}
 
 
@@ -42,6 +45,8 @@ class TeamState:
     n_season: int = 0
     new_in_league: bool = True
     form: dict = field(default_factory=dict)  # (stat, speed) -> EWMA
+    manager: str | None = None  # тренер в последнем матче
+    manager_n: int = 0          # матчей подряд с этим тренером
 
 
 class FeatureEngine:
@@ -56,6 +61,7 @@ class FeatureEngine:
         self.teams: dict[tuple[str, str], TeamState] = {}
         self.history: dict[str, list] = defaultdict(list)      # league -> [(date, h, a, hg, ag)]
         self.dc: dict[str, DixonColes] = {}
+        self.dcx: dict[str, DixonColes] = {}  # та же модель на xG
         self.dc_fit_date: dict[str, pd.Timestamp] = {}
         self.league_stats: dict[str, dict] = defaultdict(_default_league_stats)
 
@@ -101,10 +107,19 @@ class FeatureEngine:
         hist = [m for m in self.history[league] if (date - m[0]).days <= self.dc_window]
         if len(hist) < self.dc_min:
             return
-        d, h, a, hg, ag = zip(*hist)
+        d, h, a, hg, ag, hx, ax = zip(*hist)
         days_ago = np.array([(date - x).days for x in d])
         self.dc[league] = DixonColes(xi=self.dc_xi).fit(h, a, hg, ag, days_ago, warm_start=self.dc.get(league))
         self.dc_fit_date[league] = date
+
+        has_xg = ~np.isnan(np.array(hx, float)) & ~np.isnan(np.array(ax, float))
+        if has_xg.sum() >= self.dc_min:
+            sel = np.where(has_xg)[0]
+            pick = lambda seq: [seq[i] for i in sel]
+            self.dcx[league] = DixonColes(xi=self.dc_xi).fit(
+                pick(h), pick(a), pick(hx), pick(ax), days_ago[sel], warm_start=self.dcx.get(league), fit_rho=False)
+        else:
+            self.dcx.pop(league, None)
 
     # ---------- признаки ----------
     def features(self, league: str, home: str, away: str, date: pd.Timestamp,
@@ -137,6 +152,16 @@ class FeatureEngine:
                       "dc_over_2_5", "dc_btts", "dc_rho", "dc_home_adv", "dc_att_h", "dc_def_h", "dc_att_a", "dc_def_a"]:
                 f[k] = np.nan
 
+        dcx = getattr(self, "dcx", {}).get(league)  # getattr: движки, сохранённые до появления xG
+        if dcx is not None:
+            p = dcx.predict(home, away)
+            f.update(dcx_p_home=p["p_home"], dcx_p_draw=p["p_draw"], dcx_p_away=p["p_away"],
+                     dcx_lambda_h=p["lambda_home"], dcx_lambda_a=p["lambda_away"])
+            (f["dcx_att_h"], f["dcx_def_h"]), (f["dcx_att_a"], f["dcx_def_a"]) = dcx.team_strength(home), dcx.team_strength(away)
+        else:
+            for k in ["dcx_p_home", "dcx_p_draw", "dcx_p_away", "dcx_lambda_h", "dcx_lambda_a", "dcx_att_h", "dcx_def_h", "dcx_att_a", "dcx_def_a"]:
+                f[k] = np.nan
+
         for side, st in (("h", h), ("a", a)):
             for stat in FORM_STATS:
                 for speed in ALPHAS:
@@ -145,7 +170,9 @@ class FeatureEngine:
             f[f"{side}_n_league"] = min(st.n_league, 400)
             f[f"{side}_n_season"] = st.n_season
             f[f"{side}_new"] = float(st.new_in_league)
-        for stat in ["gf", "ga", "stf", "sta", "pts"]:
+            mgr = getattr(st, "manager", None)  # getattr: движки, сохранённые до появления тренеров
+            f[f"{side}_mgr_n"] = min(st.manager_n, 100) if mgr else np.nan
+        for stat in ["gf", "ga", "xgf", "xga", "stf", "sta", "pts", "lval"]:
             for speed in ALPHAS:
                 f[f"d_{stat}_{speed}"] = f[f"h_{stat}_{speed}"] - f[f"a_{stat}_{speed}"]
         f["d_rest"] = f["h_rest"] - f["a_rest"]
@@ -194,10 +221,17 @@ class FeatureEngine:
         pts_h = 3 if hg > ag else (1 if hg == ag else 0)
         pts_a = 3 if ag > hg else (1 if hg == ag else 0)
         g = lambda k: m.get(k, np.nan)
-        obs_h = {"gf": hg, "ga": ag, "sf": g("hs"), "sa": g("as"), "stf": g("hst"), "sta": g("ast"),
-                 "cf": g("hc"), "ca": g("ac"), "pts": pts_h}
-        obs_a = {"gf": ag, "ga": hg, "sf": g("as"), "sa": g("hs"), "stf": g("ast"), "sta": g("hst"),
-                 "cf": g("ac"), "ca": g("hc"), "pts": pts_a}
+        obs_h = {"gf": hg, "ga": ag, "xgf": g("hxg"), "xga": g("axg"), "sf": g("hs"), "sa": g("as"),
+                 "stf": g("hst"), "sta": g("ast"), "cf": g("hc"), "ca": g("ac"), "pts": pts_h}
+        obs_a = {"gf": ag, "ga": hg, "xgf": g("axg"), "xga": g("hxg"), "sf": g("as"), "sa": g("hs"),
+                 "stf": g("ast"), "sta": g("hst"), "cf": g("ac"), "ca": g("hc"), "pts": pts_a}
+        lv = lambda v: np.log(v) if isinstance(v, (int, float)) and v > 0 else np.nan
+        obs_h["lval"], obs_a["lval"] = lv(g("h_value")), lv(g("a_value"))
+        for st, mgr in ((h, g("h_manager")), (a, g("a_manager"))):
+            if isinstance(mgr, str) and mgr:
+                if mgr != getattr(st, "manager", None):
+                    st.manager, st.manager_n = mgr, 0
+                st.manager_n += 1
         for st, obs in ((h, obs_h), (a, obs_a)):
             for stat, v in obs.items():
                 if v is None or (isinstance(v, float) and np.isnan(v)):
@@ -215,7 +249,7 @@ class FeatureEngine:
         ls["draw"] += 0.005 * ((hg == ag) - ls["draw"])
 
         hist = self.history[league]
-        hist.append((date, m["home"], m["away"], hg, ag))
+        hist.append((date, m["home"], m["away"], hg, ag, g("hxg"), g("axg")))
         if len(hist) > 4000:  # держим только нужное окно
             del hist[:1000]
 

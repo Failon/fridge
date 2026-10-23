@@ -57,7 +57,9 @@ class DixonColes:
         self.params: np.ndarray | None = None
         self.rho = 0.0
 
-    def fit(self, home, away, hg, ag, days_ago, warm_start: "DixonColes | None" = None):
+    def fit(self, home, away, hg, ag, days_ago, warm_start: "DixonColes | None" = None, fit_rho: bool = True):
+        """hg/ag могут быть и дробными (xG): пуассоновское правдоподобие от этого не ломается.
+        Для xG поправка τ на низкие счета не имеет смысла — тогда fit_rho=False."""
         teams = sorted(set(home) | set(away))
         self.teams = {t: k for k, t in enumerate(teams)}
         n = len(teams)
@@ -96,6 +98,9 @@ class DixonColes:
         res = minimize(nll, x0, jac=True, method="L-BFGS-B")
         self.params = res.x
 
+        if not fit_rho:
+            self.rho = 0.0
+            return self
         lh, la = self._lambdas(hi, ai)
         hg_i, ag_i = hg.astype(int), ag.astype(int)
         low = (hg_i <= 1) & (ag_i <= 1)  # τ влияет только на эти счета
