@@ -18,8 +18,11 @@ RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh && chmod +x /usr/local/
     && useradd --create-home --uid 1000 app && mkdir -p data models && chown app:app data models
 USER app
 
+# потоки: см. FP_THREADS в football_predictor/model.py; OMP_NUM_THREADS — для numpy/scipy
 ENV FOOTBALL_MODEL_PATH=/app/models/predictor.pkl \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    FP_THREADS=4 \
+    OMP_NUM_THREADS=4
 VOLUME ["/app/data", "/app/models"]
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15m \

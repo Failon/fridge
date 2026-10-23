@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import os
 import warnings
 
 import lightgbm as lgb
@@ -25,12 +26,16 @@ from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings("ignore", message="X does not have valid feature names")
 
+# Потоков LightGBM. Не «все ядра»: на мелких деревьях и в виртуалке (Docker на Windows/Mac)
+# лишние потоки ждут друг друга, и обучение замедляется в десятки раз. Меняется через FP_THREADS.
+N_THREADS = int(os.environ.get("FP_THREADS", min(4, os.cpu_count() or 1)))
+
 CLF_PARAMS = dict(objective="multiclass", num_class=3, learning_rate=0.02, num_leaves=15,
                   min_child_samples=150, feature_fraction=0.6, bagging_fraction=0.8, bagging_freq=1,
-                  lambda_l2=10.0, verbose=-1, n_jobs=-1)
+                  lambda_l2=10.0, verbose=-1, n_jobs=N_THREADS)
 REG_PARAMS = dict(objective="poisson", learning_rate=0.02, num_leaves=15, min_child_samples=150,
                   feature_fraction=0.6, bagging_fraction=0.8, bagging_freq=1, lambda_l2=10.0,
-                  verbose=-1, n_jobs=-1)
+                  verbose=-1, n_jobs=N_THREADS)
 MEMBERS = ["lgbm", "logreg", "goals", "dc"]
 DEFAULT_RHO = -0.05
 
