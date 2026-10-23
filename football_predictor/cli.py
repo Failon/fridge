@@ -70,8 +70,6 @@ def cmd_backtest(args):
         probs["market"] = X.loc[te, ["mkt_p_home", "mkt_p_draw", "mkt_p_away"]].to_numpy()  # рынок без маржи
         for name, p in probs.items():
             ok = ~np.isnan(p).any(1)
-        if not ok.any():
-            continue
             if not ok.any():
                 continue
             rows.append({"season": data.season_code(s), "model": name, **report(p[ok], y[ok])})
