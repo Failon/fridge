@@ -26,7 +26,7 @@ from .data import season_of
 from .dixon_coles import DixonColes
 
 # lval — log стоимости вышедшего состава (Transfermarkt), остальное — «за/против» в матче
-FORM_STATS = ["gf", "ga", "xgf", "xga", "sf", "sa", "stf", "sta", "cf", "ca", "pts", "lval"]
+FORM_STATS = ["gf", "ga", "xgf", "xga", "sf", "sa", "stf", "sta", "cf", "ca", "pts", "lval", "lxi"]
 ALPHAS = {"fast": 0.25, "slow": 0.07}
 
 
@@ -123,7 +123,9 @@ class FeatureEngine:
 
     # ---------- признаки ----------
     def features(self, league: str, home: str, away: str, date: pd.Timestamp,
-                 odds: tuple | None = None, refit: bool = True, season: int | None = None) -> dict:
+                 odds: tuple | None = None, refit: bool = True, season: int | None = None,
+                 lineups: tuple | None = None) -> dict:
+        """lineups — стоимость стартовых составов хозяев и гостей (млн €), если они уже объявлены."""
         season = season if season is not None else season_of(date)
         if refit:
             self._maybe_refit_dc(league, date)
@@ -178,6 +180,12 @@ class FeatureEngine:
         f["d_rest"] = f["h_rest"] - f["a_rest"]
         f["season_progress"] = (h.n_season + a.n_season) / 2
 
+        # насколько объявленный старт дороже/дешевле обычного для команды (ротация, травмы лидеров)
+        lxi = [np.log(v) if isinstance(v, (int, float)) and v > 0 else np.nan for v in (lineups or (None, None))]
+        f["h_xi_dev"] = lxi[0] - h.form.get(("lxi", "slow"), np.nan)
+        f["a_xi_dev"] = lxi[1] - a.form.get(("lxi", "slow"), np.nan)
+        f["d_xi"] = lxi[0] - lxi[1]
+
         ls = self.league_stats[league]
         f["lg_home_goals"], f["lg_away_goals"], f["lg_draw_rate"] = ls["hg"], ls["ag"], ls["draw"]
 
@@ -227,6 +235,7 @@ class FeatureEngine:
                  "stf": g("ast"), "sta": g("hst"), "cf": g("ac"), "ca": g("hc"), "pts": pts_a}
         lv = lambda v: np.log(v) if isinstance(v, (int, float)) and v > 0 else np.nan
         obs_h["lval"], obs_a["lval"] = lv(g("h_value")), lv(g("a_value"))
+        obs_h["lxi"], obs_a["lxi"] = lv(g("h_xi")), lv(g("a_xi"))
         for st, mgr in ((h, g("h_manager")), (a, g("a_manager"))):
             if isinstance(mgr, str) and mgr:
                 if mgr != getattr(st, "manager", None):
@@ -262,7 +271,8 @@ def build_features(matches: pd.DataFrame, engine: FeatureEngine | None = None,
     n = len(matches)
     for i, m in enumerate(matches.to_dict("records")):
         odds = (m["odds_h"], m["odds_d"], m["odds_a"]) if pd.notna(m.get("odds_h")) else None
-        rows.append(engine.features(m["league"], m["home"], m["away"], m["date"], odds, season=m.get("season")))
+        rows.append(engine.features(m["league"], m["home"], m["away"], m["date"], odds, season=m.get("season"),
+                                    lineups=(m.get("h_xi"), m.get("a_xi"))))
         engine.update(m)
         if verbose and (i + 1) % 10000 == 0:
             print(f"  признаки: {i + 1}/{n}")

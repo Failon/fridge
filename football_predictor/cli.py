@@ -24,7 +24,8 @@ def _load_features(args):
     """Матчи + признаки + состояние движка (кэшируется, т.к. проход по истории занимает минуты)."""
     matches = data.load_matches(args.data_dir, args.extra_csv)
     key = (len(matches), str(matches["date"].max()), int(matches["hxg"].notna().sum()),
-           int(matches["h_value"].notna().sum()) if "h_value" in matches else 0, tuple(args.extra_csv or []))
+           int(matches["h_value"].notna().sum()) if "h_value" in matches else 0,
+           int(matches["h_xi"].notna().sum()) if "h_xi" in matches else 0, tuple(args.extra_csv or []))
     if FEATURES_CACHE.exists() and not args.rebuild:
         with open(FEATURES_CACHE, "rb") as f:
             cached = pickle.load(f)
@@ -67,8 +68,8 @@ def cmd_backtest(args):
     for s in test_seasons:
         tr, te = (matches["season"] < s).to_numpy(), (matches["season"] == s).to_numpy()
         print(f"\n=== Тестовый сезон {data.season_code(s)}: обучение на {tr.sum()} матчах, тест {te.sum()}")
-        model = MatchPredictor(use_market=False if args.no_market else None, calibration=args.calibration).fit(
-            X[tr], matches[tr], val_seasons=args.val_seasons)
+        model = MatchPredictor(use_market=False if args.no_market else None, calibration=args.calibration,
+                               use_lineups=args.lineups).fit(X[tr], matches[tr], val_seasons=args.val_seasons)
         y = matches.loc[te, "result"].to_numpy()
         probs = model.member_probs(X[te])
         probs["ENSEMBLE"] = model.predict_proba(X[te])
@@ -115,8 +116,8 @@ def cmd_train(args):
     matches, X, engine = _load_features(args)
     m, Xf = _filter(matches, X, args)
     print(f"Обучение на {len(m)} матчах (сезоны {data.season_code(m.season.min())}–{data.season_code(m.season.max())})")
-    model = MatchPredictor(use_market=False if args.no_market else None, calibration=args.calibration).fit(
-        Xf, m, val_seasons=args.val_seasons)
+    model = MatchPredictor(use_market=False if args.no_market else None, calibration=args.calibration,
+                           use_lineups=args.lineups).fit(Xf, m, val_seasons=args.val_seasons)
     print("\nТоп признаков (LightGBM, доля gain):")
     print(model.feature_importance(15).to_string(float_format="%.3f"))
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -203,6 +204,8 @@ def main(argv=None):
                         help="не использовать коэффициенты как признаки (чистая модель против рынка)")
     common.add_argument("--calibration", choices=["none", "temp", "dirichlet"], default="none",
                         help="калибровка вероятностей ансамбля (по умолчанию выключена — см. README)")
+    common.add_argument("--lineups", action="store_true",
+                        help="использовать стоимость объявленных стартовых составов (если они будут на прогнозе)")
     common.add_argument("--val-seasons", type=int, default=2, help="сезонов на валидацию (ранняя остановка, веса)")
 
     ap = argparse.ArgumentParser(prog="football_predictor", description="Прогнозирование футбольных матчей")

@@ -43,6 +43,7 @@ REG_PARAMS = dict(objective="poisson", learning_rate=0.02, num_leaves=15, min_ch
                   verbose=-1, n_jobs=N_THREADS)
 MEMBERS = ["lgbm", "logreg", "goals", "dc"]
 CALIBRATIONS = ["none", "temp", "dirichlet"]
+LINEUP_FEATURES = ["h_xi_dev", "a_xi_dev", "d_xi"]
 
 
 def _softmax(z: np.ndarray) -> np.ndarray:
@@ -110,9 +111,13 @@ def rho_of(X: pd.DataFrame) -> np.ndarray:
 
 
 class MatchPredictor:
-    def __init__(self, seed: int = 0, use_market: bool | None = None, calibration: str = "none"):
+    def __init__(self, seed: int = 0, use_market: bool | None = None, calibration: str = "none",
+                 use_lineups: bool = False):
         """use_market: None — брать коэффициенты, если они есть у большинства матчей; False — никогда.
-        calibration: none / temp / dirichlet (см. Calibrator)."""
+        calibration: none / temp / dirichlet (см. Calibrator).
+        use_lineups: признаки стоимости объявленного старта. Включать, только если на прогнозе составы
+        будут известны: модель, обученная с ними, без составов прогнозирует хуже (бэктест 2026/27)."""
+        self.use_lineups = use_lineups
         if calibration not in CALIBRATIONS:
             raise ValueError(f"калибровка: {CALIBRATIONS}")
         self.seed = seed
@@ -132,6 +137,8 @@ class MatchPredictor:
         market = self.use_market is not False and X["mkt_p_home"].notna().mean() >= 0.5
         if not market:
             cols = [c for c in cols if not c.startswith("mkt_")]
+        if not self.use_lineups:
+            cols = [c for c in cols if c not in LINEUP_FEATURES]
         self.members = MEMBERS + (["market"] if market else [])
         return cols
 

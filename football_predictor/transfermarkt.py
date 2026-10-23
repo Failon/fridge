@@ -19,7 +19,7 @@ import pandas as pd
 from .understat import _name_map
 
 BASE_URL = "https://pub-e682421888d945d684bcae8890b0ec20.r2.dev/data"
-TABLES = ["games", "appearances", "player_valuations"]
+TABLES = ["games", "appearances", "player_valuations", "game_lineups"]
 COMPETITIONS = {"GB1": "premier-league", "ES1": "la-liga", "IT1": "serie-a", "L1": "bundesliga", "FR1": "ligue-1"}
 
 
@@ -64,6 +64,16 @@ def match_values(cache_dir="data/transfermarkt") -> pd.DataFrame:
     app["value"] = app["market_value_in_eur"].fillna(0) / 1e6 * app["minutes_played"].clip(0, 90) / 90
     team_val = app.groupby(["game_id", "player_club_id"])["value"].sum()
 
+    # стоимость стартового состава — известна за час до матча (её же видит букмекер в закрытии)
+    xi_val = None
+    if (cache / "game_lineups.csv.gz").exists():
+        lu = pd.read_csv(cache / "game_lineups.csv.gz", usecols=["game_id", "player_id", "club_id", "date", "type"])
+        lu = lu[(lu.type == "starting_lineup") & lu.game_id.isin(games.game_id)].copy()
+        lu["date"] = pd.to_datetime(lu["date"])
+        lu = pd.merge_asof(lu.sort_values("date"), val.sort_values("date"), on="date", by="player_id",
+                           direction="backward")
+        xi_val = (lu["market_value_in_eur"].fillna(0) / 1e6).groupby([lu.game_id, lu.club_id]).sum()
+
     g = games.set_index("game_id")
     hv = team_val.reindex(list(zip(g.index, g.home_club_id))).to_numpy()
     av = team_val.reindex(list(zip(g.index, g.away_club_id))).to_numpy()
@@ -72,10 +82,14 @@ def match_values(cache_dir="data/transfermarkt") -> pd.DataFrame:
         "date": g.date.to_numpy(), "home": g.home_club_name.to_numpy(), "away": g.away_club_name.to_numpy(),
         "hg": g.home_club_goals.astype(int).to_numpy(), "ag": g.away_club_goals.astype(int).to_numpy(),
         "h_value": hv, "a_value": av,
+        "h_xi": xi_val.reindex(list(zip(g.index, g.home_club_id))).to_numpy() if xi_val is not None else np.nan,
+        "a_xi": xi_val.reindex(list(zip(g.index, g.away_club_id))).to_numpy() if xi_val is not None else np.nan,
         "h_manager": g.home_club_manager_name.to_numpy(), "a_manager": g.away_club_manager_name.to_numpy(),
     })
     out.loc[out.h_value <= 0, "h_value"] = np.nan  # нет данных по составу
     out.loc[out.a_value <= 0, "a_value"] = np.nan
+    out.loc[out.h_xi <= 0, "h_xi"] = np.nan
+    out.loc[out.a_xi <= 0, "a_xi"] = np.nan
     out.to_pickle(out_path)
     return out
 
@@ -88,7 +102,7 @@ def attach(matches: pd.DataFrame, cache_dir="data/transfermarkt") -> pd.DataFram
                    away=[names.get((lg, t)) for lg, t in zip(tm.league, tm.away)])
     key = ["league", "season", "home", "away"]
     tm = tm.dropna(subset=["home", "away"]).drop_duplicates(key)
-    cols = ["h_value", "a_value", "h_manager", "a_manager"]
+    cols = ["h_value", "a_value", "h_xi", "a_xi", "h_manager", "a_manager"]
     merged = matches.merge(tm[key + cols], on=key, how="left")
     merged.index = matches.index
     return merged
