@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-import difflib
+import os
 import pickle
 import sys
 from pathlib import Path
@@ -11,10 +11,10 @@ import numpy as np
 import pandas as pd
 
 from . import data
-from .dixon_coles import markets, score_matrix
 from .features import build_features
 from .metrics import report
-from .model import MatchPredictor, rho_of
+from .model import MatchPredictor
+from .service import Predictor, UnknownLeague, UnknownTeam
 
 FEATURES_CACHE = Path("data/features.pkl")
 MODEL_PATH = Path("models/predictor.pkl")
@@ -108,77 +108,48 @@ def cmd_train(args):
     print(f"\nМодель сохранена в {MODEL_PATH}")
 
 
-def _load_model():
+def _load_predictor() -> Predictor:
     if not MODEL_PATH.exists():
         sys.exit("Модель не найдена. Выполните `python -m football_predictor train`.")
-    with open(MODEL_PATH, "rb") as f:
-        return pickle.load(f)
+    return Predictor.load(MODEL_PATH)
 
 
-def _resolve_team(engine, league, name):
-    known = sorted({t for (lg, t) in engine.teams if lg == league})
-    if not known:
-        sys.exit(f"Нет данных по лиге {league}. Доступны: {', '.join(sorted({lg for lg, _ in engine.teams}))}")
-    if name in known:
-        return name
-    lower = {t.lower(): t for t in known}
-    if name.lower() in lower:
-        return lower[name.lower()]
-    close = difflib.get_close_matches(name, known, n=1, cutoff=0.6)
-    if close:
-        print(f"  '{name}' -> '{close[0]}'")
-        return close[0]
-    sys.exit(f"Команда '{name}' не найдена в {league}. Похожие: {difflib.get_close_matches(name, known, 5, 0.3)}")
-
-
-def _predict_one(bundle, league, home, away, date, odds=None):
-    model, engine = bundle["model"], bundle["engine"]
-    home, away = _resolve_team(engine, league, home), _resolve_team(engine, league, away)
-    feats = engine.features(league, home, away, date, odds, refit=False)
-    X = pd.DataFrame([feats])
-    p = model.predict_proba(X)[0]
-    lh, la = (v[0] for v in model.predict_goals(X))
-    mtx = score_matrix(lh, la, float(rho_of(X)[0]))
-    mk = markets(mtx)
-    top = sorted(((mtx[i, j], f"{i}:{j}") for i in range(6) for j in range(6)), reverse=True)[:5]
-    return {"league": league, "home": home, "away": away, "p_home": p[0], "p_draw": p[1], "p_away": p[2],
-            "xg_home": lh, "xg_away": la, "over_1_5": mk["over_1_5"], "over_2_5": mk["over_2_5"],
-            "over_3_5": mk["over_3_5"], "btts": mk["btts"], "top_scores": top,
-            "members": {m: p[0] for m, p in model.member_probs(X).items()}}
-
-
-def _print_prediction(r, odds=None):
-    print(f"\n{r['home']} — {r['away']}  ({r['league']})")
+def _print_prediction(r):
+    print(f"\n{r['home']} — {r['away']}  ({r['league']}, {r['date']})")
     print(f"  П1 {r['p_home']:6.1%}   X {r['p_draw']:6.1%}   П2 {r['p_away']:6.1%}")
-    print(f"  справедливые коэф.:  {1 / r['p_home']:.2f} / {1 / r['p_draw']:.2f} / {1 / r['p_away']:.2f}")
+    fo = r["fair_odds"]
+    print(f"  справедливые коэф.:  {fo['home']:.2f} / {fo['draw']:.2f} / {fo['away']:.2f}")
     print(f"  ожидаемые голы: {r['xg_home']:.2f} — {r['xg_away']:.2f}")
     print(f"  ТБ1.5 {r['over_1_5']:.1%} | ТБ2.5 {r['over_2_5']:.1%} | ТБ3.5 {r['over_3_5']:.1%} | обе забьют {r['btts']:.1%}")
-    print("  вероятные счета: " + ", ".join(f"{s} ({p:.1%})" for p, s in r["top_scores"]))
+    print("  вероятные счета: " + ", ".join(f"{t['score']} ({t['p']:.1%})" for t in r["top_scores"]))
     print("  модели ансамбля: " + "; ".join(
         f"{m}: {v[0]:.2f}/{v[1]:.2f}/{v[2]:.2f}" for m, v in r["members"].items()))
-    if odds:
-        probs = [r["p_home"], r["p_draw"], r["p_away"]]
-        for label, p, o in zip(["П1", "X", "П2"], probs, odds):
-            ev = p * o - 1
-            kelly = max(ev / (o - 1), 0) / 4  # четверть Келли — консервативный размер ставки
-            mark = "  <-- value" if ev > 0.03 else ""
-            print(f"  {label} @ {o:.2f}: EV {ev:+.1%}, ставка (1/4 Келли) {kelly:.1%} банка{mark}")
+    for v, label in zip(r["value"] or [], ["П1", "X", "П2"]):
+        mark = "  <-- value" if v["is_value"] else ""
+        print(f"  {label} @ {v['odds']:.2f}: EV {v['ev']:+.1%}, ставка (1/4 Келли) {v['stake_quarter_kelly']:.1%} банка{mark}")
+
+
+def _predict_or_exit(predictor, *a, **kw):
+    try:
+        return predictor.predict(*a, **kw)
+    except (UnknownLeague, UnknownTeam, ValueError) as exc:
+        sys.exit(str(exc))
 
 
 def cmd_predict(args):
-    bundle = _load_model()
+    predictor = _load_predictor()
     date = pd.Timestamp(args.date) if args.date else pd.Timestamp.today().normalize()
-    if date <= bundle["last_date"]:
-        print(f"Внимание: дата {date.date()} не позже последнего матча в данных ({bundle['last_date'].date()}).")
+    if date <= predictor.last_date:
+        print(f"Внимание: дата {date.date()} не позже последнего матча в данных ({predictor.last_date.date()}).")
     if args.fixtures:
         fx = pd.read_csv(args.fixtures)
         results = []
         for f in fx.to_dict("records"):
             d = pd.Timestamp(f["date"]) if "date" in f and pd.notna(f.get("date")) else date
             odds = tuple(f[k] for k in ("odds_h", "odds_d", "odds_a")) if "odds_h" in f and pd.notna(f["odds_h"]) else None
-            r = _predict_one(bundle, f["league"], f["home"], f["away"], d, odds)
-            _print_prediction(r, odds)
-            results.append({k: v for k, v in r.items() if k not in ("top_scores", "members")})
+            r = _predict_or_exit(predictor, f["league"], f["home"], f["away"], d, odds)
+            _print_prediction(r)
+            results.append({k: v for k, v in r.items() if k not in ("top_scores", "members", "value", "fair_odds")})
         if args.out:
             pd.DataFrame(results).to_csv(args.out, index=False, float_format="%.4f")
             print(f"\nСохранено в {args.out}")
@@ -186,16 +157,21 @@ def cmd_predict(args):
         if not (args.league and args.home and args.away):
             sys.exit("Укажите --league, --home и --away (или --fixtures файл.csv)")
         odds = tuple(args.odds) if args.odds else None
-        _print_prediction(_predict_one(bundle, args.league, args.home, args.away, date, odds), odds)
+        _print_prediction(_predict_or_exit(predictor, args.league, args.home, args.away, date, odds))
 
 
 def cmd_teams(args):
-    engine = _load_model()["engine"]
-    last = max(s.last_date for s in engine.teams.values())
+    predictor = _load_predictor()
     for league in args.leagues or data.LEAGUES:
-        teams = sorted(((s.elo, t) for (lg, t), s in engine.teams.items()
-                        if lg == league and (last - s.last_date).days < 365), reverse=True)
-        print(f"\n{league}: " + ", ".join(f"{t} ({e:.0f})" for e, t in teams))
+        teams = predictor.teams(league)
+        print(f"\n{league}: " + ", ".join(f"{t} ({e:.0f})" for t, e in teams))
+
+
+def cmd_serve(args):
+    import uvicorn
+
+    os.environ["FOOTBALL_MODEL_PATH"] = str(MODEL_PATH)
+    uvicorn.run("football_predictor.api:app", host=args.host, port=args.port)
 
 
 def main(argv=None):
@@ -242,6 +218,11 @@ def main(argv=None):
 
     p = add("teams", "актуальные команды и их Elo")
     p.set_defaults(func=cmd_teams)
+
+    p = add("serve", "HTTP API (FastAPI): документация на /docs")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8000)
+    p.set_defaults(func=cmd_serve)
 
     args = ap.parse_args(argv)
     args.func(args)

@@ -8,23 +8,27 @@
 
 ```bash
 pip install -r requirements.txt
-python -m football_predictor download        # ~60 тыс. матчей с 1993/94 по текущий сезон
-python -m football_predictor backtest        # честная проверка на 5 последних сезонах
-python -m football_predictor train           # финальная модель -> models/predictor.pkl
+python -m football_predictor download          # ~60 тыс. матчей с 1993/94 по текущий сезон
+python -m football_predictor backtest          # честная проверка на 5 последних сезонах
+python -m football_predictor train --no-market # финальная модель -> models/predictor.pkl
 python -m football_predictor predict --league premier-league --home Arsenal --away "Man City" \
        --date 2026-11-01 --odds 2.60 3.50 2.70
 ```
 
+`--no-market` — модель не видит коэффициенты в признаках. Для прогнозов это правильный режим:
+коэффициенты нужны только чтобы сравнить с ними модель и найти value, а модель, обученная
+на коэффициентах, просто повторяет рынок (см. бэктест ниже).
+
 Пример вывода:
 
 ```
-Arsenal — Man City  (premier-league)
-  П1  41.4%   X  29.6%   П2  28.9%
-  справедливые коэф.:  2.41 / 3.37 / 3.45
-  ожидаемые голы: 1.33 — 1.14
-  ТБ1.5 71.8% | ТБ2.5 44.8% | ТБ3.5 23.6% | обе забьют 51.2%
-  вероятные счета: 1:1 (14.0%), 1:0 (10.1%), 0:0 (9.7%), 2:1 (8.5%), 0:1 (8.4%)
-  П1 @ 2.60: EV +7.7%, ставка (1/4 Келли) 1.2% банка  <-- value
+Arsenal — Man City  (premier-league, 2026-11-01)
+  П1  41.4%   X  28.5%   П2  30.1%
+  справедливые коэф.:  2.42 / 3.51 / 3.32
+  ожидаемые голы: 1.38 — 1.19
+  ТБ1.5 74.0% | ТБ2.5 47.3% | ТБ3.5 25.7% | обе забьют 53.4%
+  вероятные счета: 1:1 (13.9%), 1:0 (9.2%), 0:0 (9.0%), 2:1 (8.7%), 0:1 (7.8%)
+  П1 @ 2.60: EV +7.6%, ставка (1/4 Келли) 1.2% банка  <-- value
 ```
 
 Другие команды:
@@ -32,7 +36,40 @@ Arsenal — Man City  (premier-league)
 * `predict --fixtures matches.csv --out preds.csv` — прогноз сразу для списка матчей
   (колонки `league,home,away[,date,odds_h,odds_d,odds_a]`);
 * `teams --leagues la-liga` — названия команд и текущие рейтинги Elo;
+* `serve` — HTTP API (ниже);
 * `--extra-csv file1.csv file2.csv` — добавить свои данные (подходит для любой команды).
+
+## HTTP API (FastAPI)
+
+```bash
+python -m football_predictor serve --host 0.0.0.0 --port 8000
+# интерактивная документация: http://localhost:8000/docs
+```
+
+| Метод | Путь | Что делает |
+|---|---|---|
+| GET | `/health` | дата последнего матча в данных, веса ансамбля |
+| GET | `/leagues` | список лиг |
+| GET | `/leagues/{league}/teams` | действующие команды и их Elo |
+| POST | `/predict` | прогноз одного матча |
+| POST | `/predict/batch` | до 200 матчей; ошибка в одном не роняет весь запрос |
+
+```bash
+curl -X POST localhost:8000/predict -H 'content-type: application/json' -d '{
+  "league": "premier-league", "home": "Arsenal", "away": "Liverpool",
+  "date": "2026-10-25", "odds": {"home": 2.2, "draw": 3.5, "away": 3.3}}'
+```
+
+В ответе — `p_home/p_draw/p_away`, `fair_odds`, `xg_home/xg_away`, тоталы, `btts`, `top_scores`,
+прогнозы каждой модели ансамбля (`members`) и, если переданы коэффициенты, `value`
+(EV и ставка по 1/4 Келли для каждого исхода). Опечатки в названиях исправляются
+(`"Real Madird"` → `Real Madrid`); неизвестная команда — `404` с похожими названиями.
+
+Модель читается из `FOOTBALL_MODEL_PATH` (по умолчанию `models/predictor.pkl`). Чтобы обновить
+прогнозы: `download` → `train --no-market --rebuild` → перезапустить сервис.
+
+Docker: `docker build -t football-predictor . && docker run -p 8000:8000 football-predictor`
+(данные качаются и модель обучается при сборке образа).
 
 ## Как это работает
 
@@ -111,6 +148,8 @@ Arsenal — Man City  (premier-league)
 | `football_predictor/dixon_coles.py` | модель Диксона–Коулза, матрица счёта, рынки |
 | `football_predictor/model.py` | LightGBM / логрегрессия / Poisson-модели, смешивание ансамбля |
 | `football_predictor/metrics.py` | RPS, log loss, Brier, точность, ECE |
+| `football_predictor/service.py` | прогноз по сохранённой модели (общий для CLI и API) |
+| `football_predictor/api.py` | HTTP API на FastAPI |
 | `football_predictor/cli.py` | командная строка |
 
 > Это инструмент для анализа, а не гарантия выигрыша. Букмекерская маржа съедает
