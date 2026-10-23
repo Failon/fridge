@@ -68,8 +68,25 @@ curl -X POST localhost:8000/predict -H 'content-type: application/json' -d '{
 Модель читается из `FOOTBALL_MODEL_PATH` (по умолчанию `models/predictor.pkl`). Чтобы обновить
 прогнозы: `download` → `train --no-market --rebuild` → перезапустить сервис.
 
-Docker: `docker build -t football-predictor . && docker run -p 8000:8000 football-predictor`
-(данные качаются и модель обучается при сборке образа).
+## Docker
+
+```bash
+docker compose up -d --build       # API на http://localhost:8000/docs
+```
+
+При первом запуске контейнер сам скачает данные и обучит модель (~5 минут, `docker compose logs -f`
+покажет прогресс), дальше стартует сразу: данные и модель лежат на томах `fp-data` и `fp-models`.
+
+```bash
+docker compose run --rm api refresh    # раз в неделю: свежие матчи + переобучение
+docker compose restart api             # подхватить новую модель
+docker compose run --rm api predict --league serie-a --home Inter --away Milan   # любая команда CLI
+```
+
+Без compose: `docker build -t football-predictor .` и
+`docker run -p 8000:8000 -v fp-data:/app/data -v fp-models:/app/models football-predictor`.
+Контейнер работает от пользователя `app` (uid 1000); если монтируете папки хоста вместо томов,
+они должны быть доступны ему на запись.
 
 ## Как это работает
 

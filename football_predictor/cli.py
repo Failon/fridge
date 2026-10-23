@@ -17,7 +17,7 @@ from .model import MatchPredictor
 from .service import Predictor, UnknownLeague, UnknownTeam
 
 FEATURES_CACHE = Path("data/features.pkl")
-MODEL_PATH = Path("models/predictor.pkl")
+MODEL_PATH = Path(os.environ.get("FOOTBALL_MODEL_PATH", "models/predictor.pkl"))
 
 
 def _load_features(args):
@@ -170,7 +170,7 @@ def cmd_teams(args):
 def cmd_serve(args):
     import uvicorn
 
-    os.environ["FOOTBALL_MODEL_PATH"] = str(MODEL_PATH)
+    os.environ.setdefault("FOOTBALL_MODEL_PATH", str(MODEL_PATH))
     uvicorn.run("football_predictor.api:app", host=args.host, port=args.port)
 
 
