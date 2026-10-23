@@ -1,31 +1,30 @@
 """Загрузка и нормализация данных о матчах.
 
-Источник по умолчанию — открытый датасет github.com/datasets/football-datasets
-(зеркало football-data.co.uk: 5 топ-лиг с сезона 1993/94, счёт, удары, угловые,
-карточки). Коэффициенты букмекеров берутся из архива github.com/jokecamp/FootballData
-(дампы football-data.co.uk, MIT): АПЛ 2002/03 – январь 2021, остальные лиги 2002/03 –
-декабрь 2013. Можно подгрузить и свои CSV в формате football-data.co.uk.
+Источник — football-data.co.uk: 5 топ-лиг с сезона 1993/94, включая текущий. Счёт, удары,
+угловые, карточки, коэффициенты букмекеров (с ~2000 г.), в свежих сезонах ещё и xG.
+Если сайт недоступен, берётся зеркало github.com/datasets/football-datasets (без коэффициентов).
+Можно подгрузить и свои CSV в том же формате.
 """
 from __future__ import annotations
 
-import io
-import urllib.parse
+import csv
 import urllib.request
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-BASE_URL = "https://raw.githubusercontent.com/datasets/football-datasets/main/datasets"
-ODDS_URL = "https://raw.githubusercontent.com/jokecamp/FootballData/master/football-data.co.uk"
+FD_URL = "https://football-data.co.uk/mmz4281"
+MIRROR_URL = "https://raw.githubusercontent.com/datasets/football-datasets/main/datasets"
 
 LEAGUES = ["premier-league", "la-liga", "serie-a", "bundesliga", "ligue-1"]
 
-# Коды football-data.co.uk -> наши названия лиг (для пользовательских CSV)
+# Коды дивизионов football-data.co.uk
 DIV_TO_LEAGUE = {"E0": "premier-league", "SP1": "la-liga", "I1": "serie-a",
                  "D1": "bundesliga", "F1": "ligue-1"}
+LEAGUE_TO_DIV = {v: k for k, v in DIV_TO_LEAGUE.items()}
 
-FIRST_SEASON, LAST_SEASON = 1993, 2025
+FIRST_SEASON = 1993
 
 
 def season_code(start_year: int) -> str:
@@ -38,64 +37,67 @@ def season_of(date: pd.Timestamp) -> int:
     return date.year if date.month >= 7 else date.year - 1
 
 
+LAST_SEASON = season_of(pd.Timestamp.today())  # текущий сезон
+
+
+def _fetch(url: str) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return resp.read()
+
+
 def download(leagues=LEAGUES, first=FIRST_SEASON, last=LAST_SEASON,
              cache_dir="data/raw", force=False) -> None:
+    """Качает сезоны с football-data.co.uk; если сайт недоступен — с GitHub-зеркала (без коэффициентов).
+
+    Текущий сезон перекачивается всегда: он пополняется каждую неделю.
+    """
     cache = Path(cache_dir)
     cache.mkdir(parents=True, exist_ok=True)
+    current = season_of(pd.Timestamp.today())
     for league in leagues:
+        div = LEAGUE_TO_DIV[league]
         for year in range(first, last + 1):
-            path = cache / f"{league}_{season_code(year)}.csv"
-            if path.exists() and not force:
+            code = season_code(year)
+            path = cache / f"{league}_{code}.csv"
+            if path.exists() and not force and year < current:
                 continue
-            url = f"{BASE_URL}/{league}/season-{season_code(year)}.csv"
-            try:
-                with urllib.request.urlopen(url, timeout=30) as resp:
-                    path.write_bytes(resp.read())
-                print(f"  скачано {league} {season_code(year)}")
-            except Exception as exc:  # сезона может не быть в датасете
-                print(f"  пропуск {league} {season_code(year)}: {exc}")
+            for url in (f"{FD_URL}/{code}/{div}.csv", f"{MIRROR_URL}/{league}/season-{code}.csv"):
+                try:
+                    path.write_bytes(_fetch(url))
+                    print(f"  {league} {code} <- {url.split('/')[2]}")
+                    break
+                except Exception as exc:
+                    err = exc
+            else:
+                print(f"  пропуск {league} {code}: {err}")
 
 
-# Файлы архива jokecamp: Англия разложена по папкам сезонов, остальные — "SP1 (N).csv"
-_ODDS_COUNTRIES = {"la-liga": ("spain", "SP1"), "serie-a": ("italy", "I1"),
-                   "bundesliga": ("germany", "D1"), "ligue-1": ("france", "F1")}
+# Коэффициенты в порядке предпочтения: закрывающие (перед стартовым свистком) точнее всего,
+# Pinnacle — самый «острый» букмекер, среднее по рынку — следующий по качеству вариант
+_ODDS_SETS = [("PSCH", "PSCD", "PSCA"), ("AvgCH", "AvgCD", "AvgCA"), ("PSH", "PSD", "PSA"),
+              ("AvgH", "AvgD", "AvgA"), ("BbAvH", "BbAvD", "BbAvA"),
+              ("B365CH", "B365CD", "B365CA"), ("B365H", "B365D", "B365A")]
 
 
-def _odds_candidates(league: str) -> list[str]:
-    if league == "premier-league":
-        folders = [f"{y}-{y + 1}" for y in range(2002, 2020)] + ["2020-2021 (Until Jan 22)"]
-        return [f"england/{f}/Premier.csv" for f in folders]
-    country, div = _ODDS_COUNTRIES[league]
-    return [f"{country}/{div}.csv"] + [f"{country}/{div} ({k}).csv" for k in range(1, 46)]
+def read_csv(path) -> pd.DataFrame:
+    """В части старых файлов строки длиннее заголовка (хвост пустых полей) — pandas их выкидывает.
+    Читаем вручную и выравниваем строки по заголовку."""
+    with open(path, encoding="latin-1", newline="") as f:
+        rows = [r for r in csv.reader(f) if any(x.strip() for x in r)]
+    if not rows:
+        return pd.DataFrame()
+    n = len(rows[0])
+    body = [(r + [""] * n)[:n] for r in rows[1:]]
+    return pd.DataFrame(body, columns=rows[0]).replace("", np.nan)
 
 
-def download_odds(leagues=LEAGUES, cache_dir="data/odds", force=False) -> None:
-    """Скачивает сезоны с коэффициентами; сезон определяется по датам внутри файла."""
-    cache = Path(cache_dir)
-    cache.mkdir(parents=True, exist_ok=True)
-    for league in leagues:
-        if not force and any(cache.glob(f"{league}_*.csv")):
-            continue
-        for rel in _odds_candidates(league):
-            try:
-                with urllib.request.urlopen(f"{ODDS_URL}/{urllib.parse.quote(rel)}", timeout=30) as resp:
-                    raw = resp.read()
-            except Exception:
-                continue  # нумерация файлов с пропусками
-            df = _normalize(pd.read_csv(io.BytesIO(raw), encoding="latin-1", on_bad_lines="skip"), league)
-            if df.empty or df["odds_h"].notna().mean() < 0.5:
-                continue  # сезоны до 2002/03 — без коэффициентов
-            season = int(df["season"].mode()[0])
-            (cache / f"{league}_{season_code(season)}.csv").write_bytes(raw)
-            print(f"  коэффициенты {league} {season_code(season)}: {len(df)} матчей")
-
-
-# Колонки с коэффициентами в порядке предпочтения: закрывающие Pinnacle — самые точные
-_ODDS_SETS = [("PSCH", "PSCD", "PSCA"), ("PSH", "PSD", "PSA"), ("AvgH", "AvgD", "AvgA"),
-              ("BbAvH", "BbAvD", "BbAvA"), ("B365H", "B365D", "B365A")]
-
-
-def _normalize(df: pd.DataFrame, league: str | None = None) -> pd.DataFrame:
+def _normalize(df: pd.DataFrame, league: str | None = None, season: int | None = None) -> pd.DataFrame:
+    df.columns = df.columns.str.replace("ï»¿", "").str.strip()  # BOM в свежих файлах
+    if "HomeTeam" not in df and "HT" in df:  # старые сезоны: HT/AT
+        df = df.rename(columns={"HT": "HomeTeam", "AT": "AwayTeam"})
+    if not {"HomeTeam", "AwayTeam", "FTHG", "FTAG"} <= set(df.columns):
+        return pd.DataFrame()
     df = df.dropna(subset=["HomeTeam", "AwayTeam", "FTHG", "FTAG"]).copy()
     if df.empty:
         return pd.DataFrame()
@@ -108,11 +110,12 @@ def _normalize(df: pd.DataFrame, league: str | None = None) -> pd.DataFrame:
         "league": league if league else df["Div"].map(DIV_TO_LEAGUE).fillna(df["Div"]),
         "home": df["HomeTeam"].astype(str).str.strip(),
         "away": df["AwayTeam"].astype(str).str.strip(),
-        "hg": df["FTHG"].astype(int),
-        "ag": df["FTAG"].astype(int),
+        "hg": pd.to_numeric(df["FTHG"], errors="coerce"),
+        "ag": pd.to_numeric(df["FTAG"], errors="coerce"),
     })
     for src, dst in [("HS", "hs"), ("AS", "as"), ("HST", "hst"), ("AST", "ast"),
-                     ("HC", "hc"), ("AC", "ac"), ("HR", "hr"), ("AR", "ar")]:
+                     ("HC", "hc"), ("AC", "ac"), ("HR", "hr"), ("AR", "ar"),
+                     ("HxG", "hxg"), ("AxG", "axg")]:
         out[dst] = pd.to_numeric(df[src], errors="coerce") if src in df else np.nan
 
     out["odds_h"] = out["odds_d"] = out["odds_a"] = np.nan
@@ -122,20 +125,21 @@ def _normalize(df: pd.DataFrame, league: str | None = None) -> pd.DataFrame:
             out.loc[mask, "odds_h"] = pd.to_numeric(df.loc[mask, h], errors="coerce")
             out.loc[mask, "odds_d"] = pd.to_numeric(df.loc[mask, d], errors="coerce")
             out.loc[mask, "odds_a"] = pd.to_numeric(df.loc[mask, a], errors="coerce")
-    out = out.dropna(subset=["date"])
-    out["season"] = out["date"].map(season_of)
+    out = out.dropna(subset=["date", "hg", "ag"])
+    out["hg"], out["ag"] = out["hg"].astype(int), out["ag"].astype(int)
+    # сезон из имени файла надёжнее даты: сезон 2019/20 доигрывали в июле-августе 2020
+    out["season"] = season if season is not None else out["date"].map(season_of)
     return out
 
 
-def load_matches(cache_dir="data/raw", extra_csv: list[str] | None = None,
-                 odds_dir="data/odds") -> pd.DataFrame:
+def load_matches(cache_dir="data/raw", extra_csv: list[str] | None = None) -> pd.DataFrame:
     frames = []
-    paths = sorted(Path(cache_dir).glob("*.csv")) + sorted(Path(odds_dir).glob("*.csv"))
-    for path in paths:
-        league = path.stem.rsplit("_", 1)[0]
-        frames.append(_normalize(pd.read_csv(path, encoding="latin-1", on_bad_lines="skip"), league))
+    for path in sorted(Path(cache_dir).glob("*.csv")):
+        league, code = path.stem.rsplit("_", 1)
+        year = 1900 + int(code[:2]) if int(code[:2]) >= 90 else 2000 + int(code[:2])
+        frames.append(_normalize(read_csv(path), league, year))
     for path in extra_csv or []:
-        raw = pd.read_csv(path, encoding="latin-1")
+        raw = read_csv(path)
         frames.append(_normalize(raw, None if "Div" in raw else Path(path).stem))
     if not frames:
         raise FileNotFoundError(f"Нет данных в {cache_dir}. Сначала выполните `download`.")

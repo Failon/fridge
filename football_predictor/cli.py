@@ -14,7 +14,7 @@ from . import data
 from .dixon_coles import markets, score_matrix
 from .features import build_features
 from .metrics import report
-from .model import MEMBERS, MatchPredictor, rho_of
+from .model import MatchPredictor, rho_of
 
 FEATURES_CACHE = Path("data/features.pkl")
 MODEL_PATH = Path("models/predictor.pkl")
@@ -22,7 +22,7 @@ MODEL_PATH = Path("models/predictor.pkl")
 
 def _load_features(args):
     """Матчи + признаки + состояние движка (кэшируется, т.к. проход по истории занимает минуты)."""
-    matches = data.load_matches(args.data_dir, args.extra_csv, args.odds_dir)
+    matches = data.load_matches(args.data_dir, args.extra_csv)
     key = (len(matches), str(matches["date"].max()), tuple(args.extra_csv or []))
     if FEATURES_CACHE.exists() and not args.rebuild:
         with open(FEATURES_CACHE, "rb") as f:
@@ -48,9 +48,6 @@ def _filter(matches, X, args):
 
 def cmd_download(args):
     data.download(args.leagues or data.LEAGUES, args.first, args.last, args.data_dir, args.force)
-    if not args.no_odds:
-        print("Коэффициенты букмекеров (архив jokecamp/FootballData)...")
-        data.download_odds(args.leagues or data.LEAGUES, args.odds_dir, args.force)
 
 
 def cmd_backtest(args):
@@ -59,21 +56,24 @@ def cmd_backtest(args):
     seasons = sorted(matches["season"].unique())
     test_seasons = seasons[-args.seasons:]
     rows, all_probs, all_y = [], {}, []
-    has_market = X["mkt_p_home"].notna().mean() > 0.5
 
     for s in test_seasons:
         tr, te = (matches["season"] < s).to_numpy(), (matches["season"] == s).to_numpy()
         print(f"\n=== Тестовый сезон {data.season_code(s)}: обучение на {tr.sum()} матчах, тест {te.sum()}")
-        model = MatchPredictor().fit(X[tr], matches[tr], val_seasons=args.val_seasons)
+        model = MatchPredictor(use_market=False if args.no_market else None).fit(
+            X[tr], matches[tr], val_seasons=args.val_seasons)
         y = matches.loc[te, "result"].to_numpy()
         probs = model.member_probs(X[te])
         probs["ENSEMBLE"] = model.predict_proba(X[te])
         base = np.bincount(matches.loc[tr, "result"], minlength=3) / tr.sum()
         probs["base_rate"] = np.tile(base, (te.sum(), 1))
-        if has_market:
-            probs["market"] = X.loc[te, ["mkt_p_home", "mkt_p_draw", "mkt_p_away"]].to_numpy()
+        probs["market"] = X.loc[te, ["mkt_p_home", "mkt_p_draw", "mkt_p_away"]].to_numpy()  # рынок без маржи
         for name, p in probs.items():
             ok = ~np.isnan(p).any(1)
+        if not ok.any():
+            continue
+            if not ok.any():
+                continue
             rows.append({"season": data.season_code(s), "model": name, **report(p[ok], y[ok])})
             all_probs.setdefault(name, []).append(p)
         all_y.append(y)
@@ -84,6 +84,8 @@ def cmd_backtest(args):
     for name, ps in all_probs.items():
         p = np.concatenate(ps)
         ok = ~np.isnan(p).any(1)
+        if not ok.any():
+            continue
         total.append({"model": name, "n": int(ok.sum()), **report(p[ok], y[ok])})
     total = pd.DataFrame(total).sort_values("RPS")
     pd.set_option("display.width", 160)
@@ -99,7 +101,7 @@ def cmd_train(args):
     matches, X, engine = _load_features(args)
     m, Xf = _filter(matches, X, args)
     print(f"Обучение на {len(m)} матчах (сезоны {data.season_code(m.season.min())}–{data.season_code(m.season.max())})")
-    model = MatchPredictor().fit(Xf, m, val_seasons=args.val_seasons)
+    model = MatchPredictor(use_market=False if args.no_market else None).fit(Xf, m, val_seasons=args.val_seasons)
     print("\nТоп признаков (LightGBM, доля gain):")
     print(model.feature_importance(15).to_string(float_format="%.3f"))
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -144,7 +146,7 @@ def _predict_one(bundle, league, home, away, date, odds=None):
     return {"league": league, "home": home, "away": away, "p_home": p[0], "p_draw": p[1], "p_away": p[2],
             "xg_home": lh, "xg_away": la, "over_1_5": mk["over_1_5"], "over_2_5": mk["over_2_5"],
             "over_3_5": mk["over_3_5"], "btts": mk["btts"], "top_scores": top,
-            "members": {m: model.member_probs(X)[m][0] for m in MEMBERS}}
+            "members": {m: p[0] for m, p in model.member_probs(X).items()}}
 
 
 def _print_prediction(r, odds=None):
@@ -201,10 +203,11 @@ def cmd_teams(args):
 def main(argv=None):
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--data-dir", default="data/raw")
-    common.add_argument("--odds-dir", default="data/odds")
     common.add_argument("--extra-csv", nargs="+", help="доп. CSV в формате football-data.co.uk (можно с коэффициентами)")
     common.add_argument("--leagues", nargs="+", help=f"подмножество лиг: {' '.join(data.LEAGUES)}")
     common.add_argument("--rebuild", action="store_true", help="пересчитать кэш признаков")
+    common.add_argument("--no-market", action="store_true",
+                        help="не использовать коэффициенты как признаки (чистая модель против рынка)")
     common.add_argument("--val-seasons", type=int, default=2, help="сезонов на валидацию (ранняя остановка, веса)")
 
     ap = argparse.ArgumentParser(prog="football_predictor", description="Прогнозирование футбольных матчей")
@@ -217,7 +220,6 @@ def main(argv=None):
     p.add_argument("--first", type=int, default=data.FIRST_SEASON)
     p.add_argument("--last", type=int, default=data.LAST_SEASON)
     p.add_argument("--force", action="store_true")
-    p.add_argument("--no-odds", action="store_true", help="не качать архив коэффициентов")
     p.set_defaults(func=cmd_download)
 
     p = add("backtest", "честная walk-forward проверка по сезонам")

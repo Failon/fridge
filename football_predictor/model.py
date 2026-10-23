@@ -53,10 +53,13 @@ def rho_of(X: pd.DataFrame) -> np.ndarray:
 
 
 class MatchPredictor:
-    def __init__(self, seed: int = 0):
+    def __init__(self, seed: int = 0, use_market: bool | None = None):
+        """use_market: None — брать коэффициенты, если они есть у большинства матчей; False — никогда."""
         self.seed = seed
+        self.use_market = use_market
         self.feature_cols: list[str] = []
         self.leagues: list[str] = []
+        self.members = list(MEMBERS)
         self.weights = np.full(len(MEMBERS), 1 / len(MEMBERS))
         self.best_iter = {"clf": 500, "hg": 500, "ag": 500}
 
@@ -64,8 +67,10 @@ class MatchPredictor:
     def _select_features(self, X: pd.DataFrame) -> list[str]:
         cols = [c for c in X.columns if c != "league"]
         # рыночные признаки берём, только если коэффициенты есть у заметной доли матчей
-        if X["mkt_p_home"].notna().mean() < 0.5:
+        market = self.use_market is not False and X["mkt_p_home"].notna().mean() >= 0.5
+        if not market:
             cols = [c for c in cols if not c.startswith("mkt_")]
+        self.members = MEMBERS + (["market"] if market else [])
         return cols
 
     def _matrix(self, X: pd.DataFrame) -> pd.DataFrame:
@@ -105,10 +110,15 @@ class MatchPredictor:
         missing = np.isnan(dc).any(1)
         dc[missing] = p["logreg"][missing]  # где DC ещё не обучен — подставляем логрег
         p["dc"] = dc
+        if "market" in self.members:  # сам рынок — тоже член ансамбля
+            mkt = X[["mkt_p_home", "mkt_p_draw", "mkt_p_away"]].to_numpy(float, copy=True)
+            missing = np.isnan(mkt).any(1)
+            mkt[missing] = p["lgbm"][missing]
+            p["market"] = mkt
         return p
 
     def _blend(self, p: dict[str, np.ndarray], w: np.ndarray) -> np.ndarray:
-        out = sum(wi * p[m] for wi, m in zip(w, MEMBERS))
+        out = sum(wi * p[m] for wi, m in zip(w, self.members))
         return out / out.sum(1, keepdims=True)
 
     def _fit_weights(self, p: dict, y: np.ndarray) -> np.ndarray:
@@ -116,7 +126,7 @@ class MatchPredictor:
             w = np.exp(z) / np.exp(z).sum()
             pr = self._blend(p, w)
             return -np.mean(np.log(np.clip(pr[np.arange(len(y)), y], 1e-12, None)))
-        res = minimize(loss, np.zeros(len(MEMBERS)), method="Nelder-Mead", options={"maxiter": 2000})
+        res = minimize(loss, np.zeros(len(self.members)), method="Nelder-Mead", options={"maxiter": 2000})
         return np.exp(res.x) / np.exp(res.x).sum()
 
     def fit(self, X: pd.DataFrame, matches: pd.DataFrame, val_seasons: int = 1, verbose: bool = True):
@@ -132,7 +142,7 @@ class MatchPredictor:
         self.weights = self._fit_weights(self.member_probs(X[va]), y[va])
         if verbose:
             print("  итерации:", self.best_iter, "| веса:",
-                  {m: round(float(w), 3) for m, w in zip(MEMBERS, self.weights)})
+                  {m: round(float(w), 3) for m, w in zip(self.members, self.weights)})
         # переобучение на всех данных (с небольшим запасом итераций под больший объём)
         iters = {k: int(v * 1.1) for k, v in self.best_iter.items()}
         self._fit_members(X, y, hg, ag, iters=iters)

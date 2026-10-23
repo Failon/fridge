@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from .data import season_of
 from .dixon_coles import DixonColes
 
 FORM_STATS = ["gf", "ga", "sf", "sa", "stf", "sta", "cf", "ca", "pts"]
@@ -107,8 +108,8 @@ class FeatureEngine:
 
     # ---------- признаки ----------
     def features(self, league: str, home: str, away: str, date: pd.Timestamp,
-                 odds: tuple | None = None, refit: bool = True) -> dict:
-        season = date.year if date.month >= 7 else date.year - 1
+                 odds: tuple | None = None, refit: bool = True, season: int | None = None) -> dict:
+        season = season if season is not None else season_of(date)
         if refit:
             self._maybe_refit_dc(league, date)
         h = self._team(league, home, date, season)
@@ -165,7 +166,7 @@ class FeatureEngine:
     def update(self, m: dict) -> None:
         """m — словарь с полями матча (league, date, home, away, hg, ag, hs, as, ...)."""
         league, date = m["league"], m["date"]
-        season = date.year if date.month >= 7 else date.year - 1
+        season = m.get("season") or season_of(date)
         h = self._team(league, m["home"], date, season)
         a = self._team(league, m["away"], date, season)
         hg, ag = int(m["hg"]), int(m["ag"])
@@ -227,7 +228,7 @@ def build_features(matches: pd.DataFrame, engine: FeatureEngine | None = None,
     n = len(matches)
     for i, m in enumerate(matches.to_dict("records")):
         odds = (m["odds_h"], m["odds_d"], m["odds_a"]) if pd.notna(m.get("odds_h")) else None
-        rows.append(engine.features(m["league"], m["home"], m["away"], m["date"], odds))
+        rows.append(engine.features(m["league"], m["home"], m["away"], m["date"], odds, season=m.get("season")))
         engine.update(m)
         if verbose and (i + 1) % 10000 == 0:
             print(f"  признаки: {i + 1}/{n}")
