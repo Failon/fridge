@@ -6,8 +6,13 @@
   3. Пуассоновские LightGBM-регрессоры голов хозяев и гостей + поправка Диксона–Коулза ->
      матрица счёта -> П1/X/П2 (а также тоталы, обе забьют, точный счёт);
   4. чистый Диксон–Коулз.
-Веса смешивания подбираются на отложенном (самом свежем) сезоне минимизацией log loss,
-после чего модели переобучаются на всех данных с найденным числом итераций.
+Веса смешивания и калибровка подбираются на отложенных (самых свежих) сезонах минимизацией
+log loss, после чего модели переобучаются на всех данных с найденным числом итераций.
+
+Калибровка (опция): temp — температура и сдвиги (3 параметра), dirichlet — матрица 3×3 и сдвиги
+над логарифмами вероятностей. По умолчанию выключена: в бэктесте 2022/23–2026/27 ансамбль и так
+откалиброван (прогноз «75%» сбывается в ~77% случаев), а калибровка ухудшала log loss
+(0.9782 → 0.9806) — сдвиги подстраивались под шум валидационных сезонов.
 """
 from __future__ import annotations
 
@@ -37,6 +42,53 @@ REG_PARAMS = dict(objective="poisson", learning_rate=0.02, num_leaves=15, min_ch
                   feature_fraction=0.6, bagging_fraction=0.8, bagging_freq=1, lambda_l2=10.0,
                   verbose=-1, n_jobs=N_THREADS)
 MEMBERS = ["lgbm", "logreg", "goals", "dc"]
+CALIBRATIONS = ["none", "temp", "dirichlet"]
+
+
+def _softmax(z: np.ndarray) -> np.ndarray:
+    z = z - z.max(1, keepdims=True)
+    e = np.exp(z)
+    return e / e.sum(1, keepdims=True)
+
+
+class Calibrator:
+    """Пересчитывает вероятности П1/X/П2: p' = softmax(W·log p + b)."""
+
+    def __init__(self, kind: str = "temp", l2: float = 0.01):
+        if kind not in CALIBRATIONS:
+            raise ValueError(f"калибровка: {CALIBRATIONS}")
+        self.kind, self.l2 = kind, l2
+        self.W, self.b = np.eye(3), np.zeros(3)
+
+    def _unpack(self, x):
+        if self.kind == "temp":  # одна «температура» на всё + сдвиги ничьей и гостей
+            return np.eye(3) * np.exp(x[0]), np.array([0.0, x[1], x[2]])
+        return x[:9].reshape(3, 3), np.concatenate([[0.0], x[9:]])
+
+    def fit(self, p: np.ndarray, y: np.ndarray) -> "Calibrator":
+        if self.kind == "none":
+            return self
+        L = np.log(np.clip(p, 1e-12, None))
+
+        def loss(x):
+            W, b = self._unpack(x)
+            q = _softmax(L @ W.T + b)
+            reg = self.l2 * np.sum((W - np.eye(3)) ** 2) if self.kind == "dirichlet" else 0.0
+            return -np.mean(np.log(np.clip(q[np.arange(len(y)), y], 1e-12, None))) + reg
+
+        x0 = np.zeros(3) if self.kind == "temp" else np.concatenate([np.eye(3).ravel(), np.zeros(2)])
+        self.W, self.b = self._unpack(minimize(loss, x0, method="L-BFGS-B").x)
+        return self
+
+    def transform(self, p: np.ndarray) -> np.ndarray:
+        if self.kind == "none":
+            return p
+        return _softmax(np.log(np.clip(p, 1e-12, None)) @ self.W.T + self.b)
+
+    def describe(self) -> str:
+        if self.kind == "temp":
+            return f"температура {1 / self.W[0, 0]:.3f}, сдвиги X {self.b[1]:+.3f}, П2 {self.b[2]:+.3f}"
+        return self.kind
 DEFAULT_RHO = -0.05
 
 
@@ -58,9 +110,14 @@ def rho_of(X: pd.DataFrame) -> np.ndarray:
 
 
 class MatchPredictor:
-    def __init__(self, seed: int = 0, use_market: bool | None = None):
-        """use_market: None — брать коэффициенты, если они есть у большинства матчей; False — никогда."""
+    def __init__(self, seed: int = 0, use_market: bool | None = None, calibration: str = "none"):
+        """use_market: None — брать коэффициенты, если они есть у большинства матчей; False — никогда.
+        calibration: none / temp / dirichlet (см. Calibrator)."""
+        if calibration not in CALIBRATIONS:
+            raise ValueError(f"калибровка: {CALIBRATIONS}")
         self.seed = seed
+        self.calibration = calibration
+        self.calibrators: dict[str, Calibrator] = {}
         self.use_market = use_market
         self.feature_cols: list[str] = []
         self.leagues: list[str] = []
@@ -144,10 +201,15 @@ class MatchPredictor:
         tr, va = seasons < val_from, seasons >= val_from
 
         self._fit_members(X[tr], y[tr], hg[tr], ag[tr], X_val=X[va], y_val=y[va], hg_val=hg[va], ag_val=ag[va])
-        self.weights = self._fit_weights(self.member_probs(X[va]), y[va])
+        p_va = self.member_probs(X[va])
+        self.weights = self._fit_weights(p_va, y[va])
+        blend_va = self._blend(p_va, self.weights)
+        # все варианты калибровки — чтобы бэктест мог их сравнить; прогноз использует self.calibration
+        self.calibrators = {k: Calibrator(k).fit(blend_va, y[va]) for k in CALIBRATIONS}
         if verbose:
             print("  итерации:", self.best_iter, "| веса:",
-                  {m: round(float(w), 3) for m, w in zip(self.members, self.weights)})
+                  {m: round(float(w), 3) for m, w in zip(self.members, self.weights)},
+                  "| калибровка:", self.calibrators["temp"].describe())
         # переобучение на всех данных (с небольшим запасом итераций под больший объём)
         iters = {k: int(v * 1.1) for k, v in self.best_iter.items()}
         self._fit_members(X, y, hg, ag, iters=iters)
@@ -155,7 +217,14 @@ class MatchPredictor:
 
     # ---------- прогноз ----------
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        return self._blend(self.member_probs(X), self.weights)
+        raw = self._blend(self.member_probs(X), self.weights)
+        cal = getattr(self, "calibrators", {}).get(getattr(self, "calibration", "none"))  # старые модели — без
+        return cal.transform(raw) if cal else raw
+
+    def predict_variants(self, X: pd.DataFrame) -> dict[str, np.ndarray]:
+        """Прогноз ансамбля при каждом варианте калибровки (для бэктеста)."""
+        raw = self._blend(self.member_probs(X), self.weights)
+        return {k: c.transform(raw) for k, c in self.calibrators.items()}
 
     def predict_goals(self, X: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
         M = self._matrix(X)

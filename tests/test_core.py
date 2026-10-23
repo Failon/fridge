@@ -53,3 +53,21 @@ def test_features_have_no_leakage():
     X1, _ = build_features(df1, verbose=False)
     X2, _ = build_features(df2, verbose=False)
     pd.testing.assert_series_equal(X1.iloc[19], X2.iloc[19])
+
+
+def test_calibrator_sharpens_underconfident_forecasts():
+    from football_predictor.metrics import log_loss
+    from football_predictor.model import Calibrator
+
+    rng = np.random.default_rng(0)
+    true = rng.dirichlet([2, 1, 1.5], size=4000)
+    y = np.array([rng.choice(3, p=p) for p in true])
+    timid = true ** 0.6
+    timid /= timid.sum(1, keepdims=True)  # «осторожный» прогноз: сжат к середине
+    for kind in ("temp", "dirichlet"):
+        cal = Calibrator(kind).fit(timid, y)
+        fixed = cal.transform(timid)
+        assert np.allclose(fixed.sum(1), 1)
+        assert log_loss(fixed, y) < log_loss(timid, y) - 0.005
+    assert 1 / Calibrator("temp").fit(timid, y).W[0, 0] < 0.8  # температура < 1 — растягивает
+    assert np.allclose(Calibrator("none").fit(timid, y).transform(timid), timid)

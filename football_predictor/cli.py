@@ -62,16 +62,18 @@ def cmd_backtest(args):
     matches, X = _filter(matches, X, args)
     seasons = sorted(matches["season"].unique())
     test_seasons = seasons[-args.seasons:]
-    rows, all_probs, all_y = [], {}, []
+    rows, all_probs, all_y, saved = [], {}, [], []
 
     for s in test_seasons:
         tr, te = (matches["season"] < s).to_numpy(), (matches["season"] == s).to_numpy()
         print(f"\n=== Тестовый сезон {data.season_code(s)}: обучение на {tr.sum()} матчах, тест {te.sum()}")
-        model = MatchPredictor(use_market=False if args.no_market else None).fit(
+        model = MatchPredictor(use_market=False if args.no_market else None, calibration=args.calibration).fit(
             X[tr], matches[tr], val_seasons=args.val_seasons)
         y = matches.loc[te, "result"].to_numpy()
         probs = model.member_probs(X[te])
         probs["ENSEMBLE"] = model.predict_proba(X[te])
+        for k, p in model.predict_variants(X[te]).items():
+            probs[f"ens_{k}"] = p
         base = np.bincount(matches.loc[tr, "result"], minlength=3) / tr.sum()
         probs["base_rate"] = np.tile(base, (te.sum(), 1))
         probs["market"] = X.loc[te, ["mkt_p_home", "mkt_p_draw", "mkt_p_away"]].to_numpy()  # рынок без маржи
@@ -82,6 +84,11 @@ def cmd_backtest(args):
             rows.append({"season": data.season_code(s), "model": name, **report(p[ok], y[ok])})
             all_probs.setdefault(name, []).append(p)
         all_y.append(y)
+        if args.save_preds:
+            out = matches.loc[te, ["season", "league", "date", "home", "away", "result"]].copy()
+            for name in ("ENSEMBLE", "ens_none", "market"):
+                out[[f"{name}_h", f"{name}_d", f"{name}_a"]] = probs[name]
+            saved.append(out)
 
     df = pd.DataFrame(rows)
     y = np.concatenate(all_y)
@@ -100,13 +107,16 @@ def cmd_backtest(args):
     print(total.to_string(index=False, float_format="%.4f"))
     if args.out:
         total.to_csv(args.out, index=False)
+    if args.save_preds:
+        pd.concat(saved).to_csv(args.save_preds, index=False, float_format="%.5f")
 
 
 def cmd_train(args):
     matches, X, engine = _load_features(args)
     m, Xf = _filter(matches, X, args)
     print(f"Обучение на {len(m)} матчах (сезоны {data.season_code(m.season.min())}–{data.season_code(m.season.max())})")
-    model = MatchPredictor(use_market=False if args.no_market else None).fit(Xf, m, val_seasons=args.val_seasons)
+    model = MatchPredictor(use_market=False if args.no_market else None, calibration=args.calibration).fit(
+        Xf, m, val_seasons=args.val_seasons)
     print("\nТоп признаков (LightGBM, доля gain):")
     print(model.feature_importance(15).to_string(float_format="%.3f"))
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -191,6 +201,8 @@ def main(argv=None):
     common.add_argument("--rebuild", action="store_true", help="пересчитать кэш признаков")
     common.add_argument("--no-market", action="store_true",
                         help="не использовать коэффициенты как признаки (чистая модель против рынка)")
+    common.add_argument("--calibration", choices=["none", "temp", "dirichlet"], default="none",
+                        help="калибровка вероятностей ансамбля (по умолчанию выключена — см. README)")
     common.add_argument("--val-seasons", type=int, default=2, help="сезонов на валидацию (ранняя остановка, веса)")
 
     ap = argparse.ArgumentParser(prog="football_predictor", description="Прогнозирование футбольных матчей")
@@ -211,6 +223,7 @@ def main(argv=None):
     p.add_argument("--seasons", type=int, default=5)
     p.add_argument("--train-from", type=int, default=1996)
     p.add_argument("--out")
+    p.add_argument("--save-preds", help="CSV с прогнозами по каждому матчу")
     p.set_defaults(func=cmd_backtest)
 
     p = add("train", "обучить финальную модель на всей истории")
