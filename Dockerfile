@@ -13,7 +13,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY football_predictor ./football_predictor
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
+# sed убирает CRLF: git на Windows может переписать окончания строк, и тогда скрипт не запустится
+RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh && chmod +x /usr/local/bin/docker-entrypoint.sh \
     && useradd --create-home --uid 1000 app && mkdir -p data models && chown app:app data models
 USER app
 
