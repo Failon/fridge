@@ -1,23 +1,30 @@
 """HTTP API прогнозов (FastAPI).
 
 Запуск:  python -m football_predictor serve        (или uvicorn football_predictor.api:app)
-Документация и «попробовать»: http://127.0.0.1:8000/docs
+Сайт: http://127.0.0.1:8000/   Документация API: http://127.0.0.1:8000/docs
 
 Модель берётся из FOOTBALL_MODEL_PATH (по умолчанию models/predictor.pkl).
 """
 from __future__ import annotations
 
 import os
+import threading
+import time
 from contextlib import asynccontextmanager
 from datetime import date as Date
+from pathlib import Path
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 
+from . import data
 from .service import Predictor, UnknownLeague, UnknownTeam, as_jsonable
 
 MAX_BATCH = 200
+FIXTURES_TTL = 30 * 60  # секунд: расписание и коэффициенты обновляются нечасто
+WEB_DIR = Path(__file__).parent / "web"
 
 
 # ---------- схемы ----------
@@ -96,6 +103,17 @@ class Team(BaseModel):
     elo: float
 
 
+class Fixture(BaseModel):
+    league: str
+    date: Date
+    time: str | None
+    home: str
+    away: str
+    odds: Odds | None
+    prediction: Prediction | None = None
+    error: str | None = None
+
+
 class Health(BaseModel):
     status: str
     data_until: Date
@@ -111,6 +129,8 @@ async def lifespan(app: FastAPI):
     if not os.path.exists(path):
         raise RuntimeError(f"Модель {path} не найдена. Выполните `python -m football_predictor train`.")
     app.state.predictor = Predictor.load(path)
+    app.state.fixtures = {"at": 0.0, "items": None}
+    app.state.fixtures_lock = threading.Lock()
     yield
 
 
@@ -171,3 +191,37 @@ def predict_batch(batch: BatchRequest, request: Request):
         except (LookupError, ValueError) as exc:
             out.append(BatchItem(request=m, error=str(exc)))
     return out
+
+
+@app.get("/fixtures", response_model=list[Fixture])
+def fixtures(request: Request):
+    """Ближайшие матчи 5 лиг (football-data.co.uk) с коэффициентами и готовыми прогнозами."""
+    st = request.app.state
+    with st.fixtures_lock:
+        if st.fixtures["items"] is not None and time.time() - st.fixtures["at"] < FIXTURES_TTL:
+            return st.fixtures["items"]
+        try:
+            fx = data.fetch_fixtures()
+        except Exception as exc:
+            if st.fixtures["items"] is not None:  # сайт недоступен — отдаём последнее известное
+                return st.fixtures["items"]
+            raise HTTPException(503, f"Не удалось загрузить расписание: {exc}")
+        pred, items = _predictor(request), []
+        for f in fx.to_dict("records"):
+            odds = (Odds(home=f["odds_h"], draw=f["odds_d"], away=f["odds_a"])
+                    if pd.notna(f["odds_h"]) and min(f["odds_h"], f["odds_d"], f["odds_a"]) > 1 else None)
+            m = MatchRequest(league=f["league"], home=f["home"], away=f["away"], date=f["date"].date(), odds=odds)
+            kickoff = f["time"] if isinstance(f["time"], str) and f["time"].strip() else None  # пустое время -> NaN
+            item = Fixture(league=m.league, date=m.date, time=kickoff, home=m.home, away=m.away, odds=odds)
+            try:
+                item.prediction = Prediction(**_run(pred, m))
+            except (LookupError, ValueError) as exc:
+                item.error = str(exc)
+            items.append(item)
+        st.fixtures = {"at": time.time(), "items": items}
+        return items
+
+
+@app.get("/", include_in_schema=False)
+def site():
+    return FileResponse(WEB_DIR / "index.html")

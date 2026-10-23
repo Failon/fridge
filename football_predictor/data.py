@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import csv
+import io
 import urllib.request
 from pathlib import Path
 
@@ -84,7 +85,11 @@ def read_csv(path) -> pd.DataFrame:
     """В части старых файлов строки длиннее заголовка (хвост пустых полей) — pandas их выкидывает.
     Читаем вручную и выравниваем строки по заголовку."""
     with open(path, encoding="latin-1", newline="") as f:
-        rows = [r for r in csv.reader(f) if any(x.strip() for x in r)]
+        return _rows_to_frame(csv.reader(f))
+
+
+def _rows_to_frame(reader) -> pd.DataFrame:
+    rows = [r for r in reader if any(x.strip() for x in r)]
     if not rows:
         return pd.DataFrame()
     n = len(rows[0])
@@ -130,6 +135,31 @@ def _normalize(df: pd.DataFrame, league: str | None = None, season: int | None =
     # сезон из имени файла надёжнее даты: сезон 2019/20 доигрывали в июле-августе 2020
     out["season"] = season if season is not None else out["date"].map(season_of)
     return out
+
+
+FIXTURES_URL = "https://football-data.co.uk/fixtures.csv"
+
+
+def fetch_fixtures() -> pd.DataFrame:
+    """Ближайшие матчи 5 лиг с коэффициентами (football-data.co.uk обновляет файл к каждому туру)."""
+    text = _fetch(FIXTURES_URL).decode("latin-1")
+    df = _rows_to_frame(csv.reader(io.StringIO(text)))
+    df.columns = df.columns.str.replace("ï»¿", "").str.strip()
+    df = df[df["Div"].isin(DIV_TO_LEAGUE)].copy()
+    out = pd.DataFrame({
+        "league": df["Div"].map(DIV_TO_LEAGUE),
+        "date": pd.to_datetime(df["Date"], format="%d/%m/%Y", errors="coerce"),
+        "time": df["Time"] if "Time" in df else None,
+        "home": df["HomeTeam"].str.strip(),
+        "away": df["AwayTeam"].str.strip(),
+    })
+    out["odds_h"] = out["odds_d"] = out["odds_a"] = np.nan
+    for h, d, a in [("AvgH", "AvgD", "AvgA"), ("B365H", "B365D", "B365A")]:  # средние по рынку точнее
+        if h in df:
+            mask = out["odds_h"].isna()
+            for col, src in (("odds_h", h), ("odds_d", d), ("odds_a", a)):
+                out.loc[mask, col] = pd.to_numeric(df.loc[mask, src], errors="coerce")
+    return out.dropna(subset=["date"]).sort_values(["date", "time", "league"]).reset_index(drop=True)
 
 
 def load_matches(cache_dir="data/raw", extra_csv: list[str] | None = None) -> pd.DataFrame:

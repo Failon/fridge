@@ -125,8 +125,10 @@ def _print_prediction(r):
     print("  модели ансамбля: " + "; ".join(
         f"{m}: {v[0]:.2f}/{v[1]:.2f}/{v[2]:.2f}" for m, v in r["members"].items()))
     for v, label in zip(r["value"] or [], ["П1", "X", "П2"]):
-        mark = "  <-- value" if v["is_value"] else ""
-        print(f"  {label} @ {v['odds']:.2f}: EV {v['ev']:+.1%}, ставка (1/4 Келли) {v['stake_quarter_kelly']:.1%} банка{mark}")
+        mark = "  <-- модель выше рынка" if v["is_value"] else ""
+        print(f"  {label} @ {v['odds']:.2f}: EV по модели {v['ev']:+.1%}{mark}")
+    if r["value"]:
+        print("  (в бэктесте ставки по сигналам «модель выше рынка» теряли 13–19% — рынок точнее модели)")
 
 
 def _predict_or_exit(predictor, *a, **kw):

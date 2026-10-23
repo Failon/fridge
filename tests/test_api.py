@@ -79,3 +79,21 @@ def test_batch_keeps_going_on_error(client):
     items = r.json()
     assert items[0]["prediction"] is not None and items[0]["error"] is None
     assert items[1]["prediction"] is None and "Nobody" in items[1]["error"]
+
+
+def test_site_and_fixtures(client, monkeypatch):
+    from football_predictor import data
+    fx = pd.DataFrame([
+        dict(league="premier-league", date=pd.Timestamp("2022-08-20"), time="15:00", home="Team H", away="Team A",
+             odds_h=1.5, odds_d=4.0, odds_a=7.0),
+        dict(league="premier-league", date=pd.Timestamp("2022-08-21"), time=None, home="Unknown FC", away="Team A",
+             odds_h=float("nan"), odds_d=float("nan"), odds_a=float("nan")),
+    ])
+    monkeypatch.setattr(data, "fetch_fixtures", lambda: fx)
+    client.app.state.fixtures = {"at": 0.0, "items": None}
+    items = client.get("/fixtures").json()
+    assert items[0]["prediction"]["p_home"] > 0.5 and items[0]["odds"]["home"] == 1.5
+    assert items[1]["prediction"] is None and "Unknown FC" in items[1]["error"]
+
+    page = client.get("/")
+    assert page.status_code == 200 and "Прогноз матчей" in page.text
