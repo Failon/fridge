@@ -22,7 +22,7 @@ MODEL_PATH = Path("models/predictor.pkl")
 
 def _load_features(args):
     """Матчи + признаки + состояние движка (кэшируется, т.к. проход по истории занимает минуты)."""
-    matches = data.load_matches(args.data_dir, args.extra_csv)
+    matches = data.load_matches(args.data_dir, args.extra_csv, args.odds_dir)
     key = (len(matches), str(matches["date"].max()), tuple(args.extra_csv or []))
     if FEATURES_CACHE.exists() and not args.rebuild:
         with open(FEATURES_CACHE, "rb") as f:
@@ -48,6 +48,9 @@ def _filter(matches, X, args):
 
 def cmd_download(args):
     data.download(args.leagues or data.LEAGUES, args.first, args.last, args.data_dir, args.force)
+    if not args.no_odds:
+        print("Коэффициенты букмекеров (архив jokecamp/FootballData)...")
+        data.download_odds(args.leagues or data.LEAGUES, args.odds_dir, args.force)
 
 
 def cmd_backtest(args):
@@ -198,6 +201,7 @@ def cmd_teams(args):
 def main(argv=None):
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--data-dir", default="data/raw")
+    common.add_argument("--odds-dir", default="data/odds")
     common.add_argument("--extra-csv", nargs="+", help="доп. CSV в формате football-data.co.uk (можно с коэффициентами)")
     common.add_argument("--leagues", nargs="+", help=f"подмножество лиг: {' '.join(data.LEAGUES)}")
     common.add_argument("--rebuild", action="store_true", help="пересчитать кэш признаков")
@@ -213,6 +217,7 @@ def main(argv=None):
     p.add_argument("--first", type=int, default=data.FIRST_SEASON)
     p.add_argument("--last", type=int, default=data.LAST_SEASON)
     p.add_argument("--force", action="store_true")
+    p.add_argument("--no-odds", action="store_true", help="не качать архив коэффициентов")
     p.set_defaults(func=cmd_download)
 
     p = add("backtest", "честная walk-forward проверка по сезонам")

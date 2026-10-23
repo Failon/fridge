@@ -2,11 +2,14 @@
 
 Источник по умолчанию — открытый датасет github.com/datasets/football-datasets
 (зеркало football-data.co.uk: 5 топ-лиг с сезона 1993/94, счёт, удары, угловые,
-карточки). Дополнительно можно подгрузить свои CSV в формате football-data.co.uk —
-если в них есть коэффициенты букмекеров, они будут использованы как признаки.
+карточки). Коэффициенты букмекеров берутся из архива github.com/jokecamp/FootballData
+(дампы football-data.co.uk, MIT): АПЛ 2002/03 – январь 2021, остальные лиги 2002/03 –
+декабрь 2013. Можно подгрузить и свои CSV в формате football-data.co.uk.
 """
 from __future__ import annotations
 
+import io
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -14,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 BASE_URL = "https://raw.githubusercontent.com/datasets/football-datasets/main/datasets"
+ODDS_URL = "https://raw.githubusercontent.com/jokecamp/FootballData/master/football-data.co.uk"
 
 LEAGUES = ["premier-league", "la-liga", "serie-a", "bundesliga", "ligue-1"]
 
@@ -52,6 +56,40 @@ def download(leagues=LEAGUES, first=FIRST_SEASON, last=LAST_SEASON,
                 print(f"  пропуск {league} {season_code(year)}: {exc}")
 
 
+# Файлы архива jokecamp: Англия разложена по папкам сезонов, остальные — "SP1 (N).csv"
+_ODDS_COUNTRIES = {"la-liga": ("spain", "SP1"), "serie-a": ("italy", "I1"),
+                   "bundesliga": ("germany", "D1"), "ligue-1": ("france", "F1")}
+
+
+def _odds_candidates(league: str) -> list[str]:
+    if league == "premier-league":
+        folders = [f"{y}-{y + 1}" for y in range(2002, 2020)] + ["2020-2021 (Until Jan 22)"]
+        return [f"england/{f}/Premier.csv" for f in folders]
+    country, div = _ODDS_COUNTRIES[league]
+    return [f"{country}/{div}.csv"] + [f"{country}/{div} ({k}).csv" for k in range(1, 46)]
+
+
+def download_odds(leagues=LEAGUES, cache_dir="data/odds", force=False) -> None:
+    """Скачивает сезоны с коэффициентами; сезон определяется по датам внутри файла."""
+    cache = Path(cache_dir)
+    cache.mkdir(parents=True, exist_ok=True)
+    for league in leagues:
+        if not force and any(cache.glob(f"{league}_*.csv")):
+            continue
+        for rel in _odds_candidates(league):
+            try:
+                with urllib.request.urlopen(f"{ODDS_URL}/{urllib.parse.quote(rel)}", timeout=30) as resp:
+                    raw = resp.read()
+            except Exception:
+                continue  # нумерация файлов с пропусками
+            df = _normalize(pd.read_csv(io.BytesIO(raw), encoding="latin-1", on_bad_lines="skip"), league)
+            if df.empty or df["odds_h"].notna().mean() < 0.5:
+                continue  # сезоны до 2002/03 — без коэффициентов
+            season = int(df["season"].mode()[0])
+            (cache / f"{league}_{season_code(season)}.csv").write_bytes(raw)
+            print(f"  коэффициенты {league} {season_code(season)}: {len(df)} матчей")
+
+
 # Колонки с коэффициентами в порядке предпочтения: закрывающие Pinnacle — самые точные
 _ODDS_SETS = [("PSCH", "PSCD", "PSCA"), ("PSH", "PSD", "PSA"), ("AvgH", "AvgD", "AvgA"),
               ("BbAvH", "BbAvD", "BbAvA"), ("B365H", "B365D", "B365A")]
@@ -62,9 +100,9 @@ def _normalize(df: pd.DataFrame, league: str | None = None) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
     dates = pd.to_datetime(df["Date"], format="%Y-%m-%d", errors="coerce")
-    if dates.isna().any():  # формат football-data.co.uk: dd/mm/yy или dd/mm/yyyy
-        alt = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
-        dates = dates.fillna(alt)
+    for fmt in ("%d/%m/%y", "%d/%m/%Y"):  # формат football-data.co.uk
+        if dates.isna().any():
+            dates = dates.fillna(pd.to_datetime(df["Date"], format=fmt, errors="coerce"))
     out = pd.DataFrame({
         "date": dates,
         "league": league if league else df["Div"].map(DIV_TO_LEAGUE).fillna(df["Div"]),
@@ -89,11 +127,13 @@ def _normalize(df: pd.DataFrame, league: str | None = None) -> pd.DataFrame:
     return out
 
 
-def load_matches(cache_dir="data/raw", extra_csv: list[str] | None = None) -> pd.DataFrame:
+def load_matches(cache_dir="data/raw", extra_csv: list[str] | None = None,
+                 odds_dir="data/odds") -> pd.DataFrame:
     frames = []
-    for path in sorted(Path(cache_dir).glob("*.csv")):
+    paths = sorted(Path(cache_dir).glob("*.csv")) + sorted(Path(odds_dir).glob("*.csv"))
+    for path in paths:
         league = path.stem.rsplit("_", 1)[0]
-        frames.append(_normalize(pd.read_csv(path, encoding="latin-1"), league))
+        frames.append(_normalize(pd.read_csv(path, encoding="latin-1", on_bad_lines="skip"), league))
     for path in extra_csv or []:
         raw = pd.read_csv(path, encoding="latin-1")
         frames.append(_normalize(raw, None if "Div" in raw else Path(path).stem))
