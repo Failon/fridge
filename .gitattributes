@@ -1,0 +1,3 @@
+# скрипты и Dockerfile всегда с LF, даже при клонировании на Windows
+*.sh text eol=lf
+Dockerfile text eol=lf

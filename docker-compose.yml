@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    image: football-predictor
+    ports:
+      - "8000:8000"
+    volumes:
+      - fp-data:/app/data
+      - fp-models:/app/models
+    restart: unless-stopped
+
+volumes:
+  fp-data:
+  fp-models:

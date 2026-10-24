@@ -1,0 +1,9 @@
+data/
+models/
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+.git/
+analysis/
+tests/
+*.pkl

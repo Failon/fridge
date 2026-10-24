@@ -1,0 +1,302 @@
+"""Последовательная генерация признаков без утечки будущего.
+
+Матчи обрабатываются строго по времени: для каждого матча сначала считаются признаки
+по состоянию «до матча», затем состояние обновляется его результатом. Тот же движок
+после прохода по всей истории используется для прогноза будущих матчей.
+
+Признаки:
+  * Elo с поправкой на разницу мячей и откатом к среднему между сезонами;
+  * pi-ratings (Constantinou & Fenton, 2013) — раздельные домашний/гостевой рейтинги;
+  * Диксон–Коулз с затуханием по времени (переобучается раз в неделю на каждую лигу) —
+    по голам и отдельно по xG (xG меньше зависят от везения);
+  * стоимость вышедшего состава (EWMA, Transfermarkt) и стаж тренера;
+  * экспоненциально сглаженная форма (быстрая и медленная): голы, xG, удары, удары в створ,
+    угловые, очки; отдых, опыт в лиге, признак новичка;
+  * рыночные вероятности из коэффициентов (если они есть в данных).
+"""
+from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import dataclass, field
+
+import numpy as np
+import pandas as pd
+
+from .data import LEAGUE_INFO, season_of
+from .dixon_coles import DixonColes
+
+# lval — log стоимости вышедшего состава (Transfermarkt), остальное — «за/против» в матче
+FORM_STATS = ["gf", "ga", "xgf", "xga", "sf", "sa", "stf", "sta", "cf", "ca", "pts", "lval", "lxi"]
+ALPHAS = {"fast": 0.25, "slow": 0.07}
+
+
+def _default_league_stats():
+    return {"hg": 1.5, "ag": 1.1, "draw": 0.26}
+
+
+@dataclass
+class TeamState:
+    elo: float
+    pi_home: float
+    pi_away: float
+    season: int
+    last_date: pd.Timestamp | None = None
+    n_league: int = 0          # матчей в лиге за всё время
+    n_season: int = 0
+    new_in_league: bool = True
+    came_from: int = 0          # в первом сезоне в лиге: +1 вылетел сверху, −1 поднялся снизу, 0 — неизвестно
+    form: dict = field(default_factory=dict)  # (stat, speed) -> EWMA
+    manager: str | None = None  # тренер в последнем матче
+    manager_n: int = 0          # матчей подряд с этим тренером
+
+
+class FeatureEngine:
+    def __init__(self, elo_k: float = 20.0, elo_hfa: float = 65.0, elo_revert: float = 0.2,
+                 pi_lambda: float = 0.035, pi_gamma: float = 0.7, pi_c: float = 3.0,
+                 dc_window_days: int = 3 * 365, dc_refit_days: int = 7, dc_min_matches: int = 250,
+                 dc_xi: float = 0.0019):
+        self.elo_k, self.elo_hfa, self.elo_revert = elo_k, elo_hfa, elo_revert
+        self.pi_lambda, self.pi_gamma, self.pi_c = pi_lambda, pi_gamma, pi_c
+        self.dc_window, self.dc_refit, self.dc_min, self.dc_xi = dc_window_days, dc_refit_days, dc_min_matches, dc_xi
+
+        self.teams: dict[tuple[str, str], TeamState] = {}
+        self.history: dict[str, list] = defaultdict(list)      # league -> [(date, h, a, hg, ag)]
+        self.dc: dict[str, DixonColes] = {}
+        self.dcx: dict[str, DixonColes] = {}  # та же модель на xG
+        self.dc_fit_date: dict[str, pd.Timestamp] = {}
+        self.league_stats: dict[str, dict] = defaultdict(_default_league_stats)
+
+    # ---------- рейтинги ----------
+    def _league_teams(self, league, date):
+        # только команды, игравшие в лиге за последний год (вылетевшие не в счёт)
+        return [s for (lg, _), s in self.teams.items()
+                if lg == league and s.last_date is not None and (date - s.last_date).days < 365]
+
+    def _came_from(self, league: str, name: str, date: pd.Timestamp) -> int:
+        """Откуда пришла команда: +1 — из дивизиона выше (вылет), −1 — снизу (повышение), 0 — не знаем."""
+        country, tier = LEAGUE_INFO.get(league, (None, None))
+        if country is None:
+            return 0
+        best = None
+        for other, (c, t) in LEAGUE_INFO.items():
+            st = self.teams.get((other, name)) if other != league and c == country else None
+            if st is not None and st.last_date is not None and (date - st.last_date).days < 400:
+                if best is None or st.last_date > best[0]:
+                    best = (st.last_date, t)
+        return 0 if best is None else (1 if best[1] < tier else -1)
+
+    def _team(self, league: str, name: str, date: pd.Timestamp, season: int) -> TeamState:
+        key = (league, name)
+        st = self.teams.get(key)
+        if st is None:
+            others = self._league_teams(league, date)
+            came = self._came_from(league, name, date)
+            # вылетевший из дивизиона выше обычно один из сильнейших, поднявшийся — слабее среднего
+            q = 0.8 if came > 0 else 0.15
+            if len(others) >= 10:
+                elo = float(np.quantile([o.elo for o in others], q))
+                pih = float(np.quantile([o.pi_home for o in others], q))
+                pia = float(np.quantile([o.pi_away for o in others], q))
+            else:
+                elo, pih, pia = 1500.0, 0.0, 0.0
+            st = TeamState(elo=elo, pi_home=pih, pi_away=pia, season=season, came_from=came)
+            self.teams[key] = st
+        elif st.season != season:
+            # новый сезон: откат Elo к среднему; вернувшийся после вылета — снова «новичок»
+            others = self._league_teams(league, date)
+            if others:
+                mean_elo = float(np.mean([o.elo for o in others]))
+                st.elo = st.elo * (1 - self.elo_revert) + mean_elo * self.elo_revert
+            st.new_in_league = st.last_date is not None and (date - st.last_date).days > 150
+            st.came_from = self._came_from(league, name, date) if st.new_in_league else 0
+            if st.new_in_league and len(others) >= 10:
+                elos = [o.elo for o in others]
+                st.elo = (max(st.elo, float(np.quantile(elos, 0.7))) if st.came_from > 0
+                          else min(st.elo, float(np.quantile(elos, 0.3))))
+            st.season, st.n_season = season, 0
+        return st
+
+    def _pi_expected_gd(self, r: float) -> float:
+        return np.sign(r) * (10 ** (abs(r) / self.pi_c) - 1)
+
+    # ---------- Диксон–Коулз ----------
+    def _maybe_refit_dc(self, league: str, date: pd.Timestamp):
+        last = self.dc_fit_date.get(league)
+        if last is not None and (date - last).days < self.dc_refit:
+            return
+        hist = [m for m in self.history[league] if (date - m[0]).days <= self.dc_window]
+        if len(hist) < self.dc_min:
+            return
+        d, h, a, hg, ag, hx, ax = zip(*hist)
+        days_ago = np.array([(date - x).days for x in d])
+        self.dc[league] = DixonColes(xi=self.dc_xi).fit(h, a, hg, ag, days_ago, warm_start=self.dc.get(league))
+        self.dc_fit_date[league] = date
+
+        has_xg = ~np.isnan(np.array(hx, float)) & ~np.isnan(np.array(ax, float))
+        if has_xg.sum() >= self.dc_min:
+            sel = np.where(has_xg)[0]
+            pick = lambda seq: [seq[i] for i in sel]
+            self.dcx[league] = DixonColes(xi=self.dc_xi).fit(
+                pick(h), pick(a), pick(hx), pick(ax), days_ago[sel], warm_start=self.dcx.get(league), fit_rho=False)
+        else:
+            self.dcx.pop(league, None)
+
+    # ---------- признаки ----------
+    def features(self, league: str, home: str, away: str, date: pd.Timestamp,
+                 odds: tuple | None = None, refit: bool = True, season: int | None = None,
+                 lineups: tuple | None = None) -> dict:
+        """lineups — стоимость стартовых составов хозяев и гостей (млн €), если они уже объявлены."""
+        season = season if season is not None else season_of(date)
+        if refit:
+            self._maybe_refit_dc(league, date)
+        h = self._team(league, home, date, season)
+        a = self._team(league, away, date, season)
+
+        f = {"league": league}
+        f["elo_h"], f["elo_a"] = h.elo, a.elo
+        f["elo_diff"] = h.elo + self.elo_hfa - a.elo
+        f["elo_p_home"] = 1 / (1 + 10 ** (-f["elo_diff"] / 400))
+        f["pi_h"], f["pi_a"] = h.pi_home, a.pi_away
+        f["pi_gd"] = self._pi_expected_gd(h.pi_home) - self._pi_expected_gd(a.pi_away)
+        f["pi_overall_diff"] = (h.pi_home + h.pi_away - a.pi_home - a.pi_away) / 2
+
+        dc = self.dc.get(league)
+        if dc is not None:
+            qh, qa = (0.8 if getattr(t, "came_from", 0) > 0 else 0.2 for t in (h, a))
+            p = dc.predict(home, away, qh, qa)
+            f.update(dc_p_home=p["p_home"], dc_p_draw=p["p_draw"], dc_p_away=p["p_away"],
+                     dc_lambda_h=p["lambda_home"], dc_lambda_a=p["lambda_away"],
+                     dc_over_2_5=p["over_2_5"], dc_btts=p["btts"], dc_rho=dc.rho, dc_home_adv=dc.params[-1])
+            ah, dh = dc.team_strength(home, qh)
+            aa, da = dc.team_strength(away, qa)
+            f.update(dc_att_h=ah, dc_def_h=dh, dc_att_a=aa, dc_def_a=da)
+        else:
+            for k in ["dc_p_home", "dc_p_draw", "dc_p_away", "dc_lambda_h", "dc_lambda_a",
+                      "dc_over_2_5", "dc_btts", "dc_rho", "dc_home_adv", "dc_att_h", "dc_def_h", "dc_att_a", "dc_def_a"]:
+                f[k] = np.nan
+
+        dcx = getattr(self, "dcx", {}).get(league)  # getattr: движки, сохранённые до появления xG
+        if dcx is not None:
+            p = dcx.predict(home, away)
+            f.update(dcx_p_home=p["p_home"], dcx_p_draw=p["p_draw"], dcx_p_away=p["p_away"],
+                     dcx_lambda_h=p["lambda_home"], dcx_lambda_a=p["lambda_away"])
+            (f["dcx_att_h"], f["dcx_def_h"]), (f["dcx_att_a"], f["dcx_def_a"]) = dcx.team_strength(home), dcx.team_strength(away)
+        else:
+            for k in ["dcx_p_home", "dcx_p_draw", "dcx_p_away", "dcx_lambda_h", "dcx_lambda_a", "dcx_att_h", "dcx_def_h", "dcx_att_a", "dcx_def_a"]:
+                f[k] = np.nan
+
+        for side, st in (("h", h), ("a", a)):
+            for stat in FORM_STATS:
+                for speed in ALPHAS:
+                    f[f"{side}_{stat}_{speed}"] = st.form.get((stat, speed), np.nan)
+            f[f"{side}_rest"] = min((date - st.last_date).days, 30) if st.last_date is not None else 30
+            f[f"{side}_n_league"] = min(st.n_league, 400)
+            f[f"{side}_n_season"] = st.n_season
+            f[f"{side}_new"] = float(st.new_in_league)
+            f[f"{side}_from"] = float(getattr(st, "came_from", 0))
+            mgr = getattr(st, "manager", None)  # getattr: движки, сохранённые до появления тренеров
+            f[f"{side}_mgr_n"] = min(st.manager_n, 100) if mgr else np.nan
+        for stat in ["gf", "ga", "xgf", "xga", "stf", "sta", "pts", "lval"]:
+            for speed in ALPHAS:
+                f[f"d_{stat}_{speed}"] = f[f"h_{stat}_{speed}"] - f[f"a_{stat}_{speed}"]
+        f["d_rest"] = f["h_rest"] - f["a_rest"]
+        f["season_progress"] = (h.n_season + a.n_season) / 2
+
+        # насколько объявленный старт дороже/дешевле обычного для команды (ротация, травмы лидеров)
+        lxi = [np.log(v) if isinstance(v, (int, float)) and v > 0 else np.nan for v in (lineups or (None, None))]
+        f["h_xi_dev"] = lxi[0] - h.form.get(("lxi", "slow"), np.nan)
+        f["a_xi_dev"] = lxi[1] - a.form.get(("lxi", "slow"), np.nan)
+        f["d_xi"] = lxi[0] - lxi[1]
+
+        ls = self.league_stats[league]
+        f["lg_home_goals"], f["lg_away_goals"], f["lg_draw_rate"] = ls["hg"], ls["ag"], ls["draw"]
+
+        if odds is not None and all(o and o > 1 for o in odds):
+            inv = np.array([1 / o for o in odds])
+            f["mkt_p_home"], f["mkt_p_draw"], f["mkt_p_away"] = inv / inv.sum()  # снимаем маржу
+            f["mkt_margin"] = inv.sum() - 1
+        else:
+            f["mkt_p_home"] = f["mkt_p_draw"] = f["mkt_p_away"] = f["mkt_margin"] = np.nan
+        return f
+
+    # ---------- обновление состояния ----------
+    def update(self, m: dict) -> None:
+        """m — словарь с полями матча (league, date, home, away, hg, ag, hs, as, ...)."""
+        league, date = m["league"], m["date"]
+        season = m.get("season") or season_of(date)
+        h = self._team(league, m["home"], date, season)
+        a = self._team(league, m["away"], date, season)
+        hg, ag = int(m["hg"]), int(m["ag"])
+
+        # Elo с множителем на разницу мячей (World Football Elo)
+        gd = abs(hg - ag)
+        mult = 1 if gd <= 1 else (1.5 if gd == 2 else (11 + gd) / 8)
+        exp_h = 1 / (1 + 10 ** (-(h.elo + self.elo_hfa - a.elo) / 400))
+        score_h = 1.0 if hg > ag else (0.5 if hg == ag else 0.0)
+        delta = self.elo_k * mult * (score_h - exp_h)
+        h.elo += delta
+        a.elo -= delta
+
+        # pi-ratings
+        pred_gd = self._pi_expected_gd(h.pi_home) - self._pi_expected_gd(a.pi_away)
+        err = (hg - ag) - pred_gd
+        psi = np.sign(err) * self.pi_c * np.log10(1 + abs(err))
+        dh, da = psi * self.pi_lambda, -psi * self.pi_lambda
+        h.pi_home += dh
+        h.pi_away += dh * self.pi_gamma
+        a.pi_away += da
+        a.pi_home += da * self.pi_gamma
+
+        # форма
+        pts_h = 3 if hg > ag else (1 if hg == ag else 0)
+        pts_a = 3 if ag > hg else (1 if hg == ag else 0)
+        g = lambda k: m.get(k, np.nan)
+        obs_h = {"gf": hg, "ga": ag, "xgf": g("hxg"), "xga": g("axg"), "sf": g("hs"), "sa": g("as"),
+                 "stf": g("hst"), "sta": g("ast"), "cf": g("hc"), "ca": g("ac"), "pts": pts_h}
+        obs_a = {"gf": ag, "ga": hg, "xgf": g("axg"), "xga": g("hxg"), "sf": g("as"), "sa": g("hs"),
+                 "stf": g("ast"), "sta": g("hst"), "cf": g("ac"), "ca": g("hc"), "pts": pts_a}
+        lv = lambda v: np.log(v) if isinstance(v, (int, float)) and v > 0 else np.nan
+        obs_h["lval"], obs_a["lval"] = lv(g("h_value")), lv(g("a_value"))
+        obs_h["lxi"], obs_a["lxi"] = lv(g("h_xi")), lv(g("a_xi"))
+        for st, mgr in ((h, g("h_manager")), (a, g("a_manager"))):
+            if isinstance(mgr, str) and mgr:
+                if mgr != getattr(st, "manager", None):
+                    st.manager, st.manager_n = mgr, 0
+                st.manager_n += 1
+        for st, obs in ((h, obs_h), (a, obs_a)):
+            for stat, v in obs.items():
+                if v is None or (isinstance(v, float) and np.isnan(v)):
+                    continue
+                for speed, alpha in ALPHAS.items():
+                    prev = st.form.get((stat, speed))
+                    st.form[(stat, speed)] = v if prev is None else prev + alpha * (v - prev)
+            st.last_date = date
+            st.n_league += 1
+            st.n_season += 1
+
+        ls = self.league_stats[league]
+        ls["hg"] += 0.005 * (hg - ls["hg"])
+        ls["ag"] += 0.005 * (ag - ls["ag"])
+        ls["draw"] += 0.005 * ((hg == ag) - ls["draw"])
+
+        hist = self.history[league]
+        hist.append((date, m["home"], m["away"], hg, ag, g("hxg"), g("axg")))
+        if len(hist) > 4000:  # держим только нужное окно
+            del hist[:1000]
+
+
+def build_features(matches: pd.DataFrame, engine: FeatureEngine | None = None,
+                   verbose: bool = True) -> tuple[pd.DataFrame, FeatureEngine]:
+    """Проходит по всем матчам по времени, возвращает таблицу признаков (по строке на матч)."""
+    engine = engine or FeatureEngine()
+    rows = []
+    n = len(matches)
+    for i, m in enumerate(matches.to_dict("records")):
+        odds = (m["odds_h"], m["odds_d"], m["odds_a"]) if pd.notna(m.get("odds_h")) else None
+        rows.append(engine.features(m["league"], m["home"], m["away"], m["date"], odds, season=m.get("season"),
+                                    lineups=(m.get("h_xi"), m.get("a_xi"))))
+        engine.update(m)
+        if verbose and (i + 1) % 10000 == 0:
+            print(f"  признаки: {i + 1}/{n}")
+    feats = pd.DataFrame(rows, index=matches.index)
+    return feats, engine
