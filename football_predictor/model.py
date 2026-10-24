@@ -106,6 +106,19 @@ def matrix_1x2(lh: np.ndarray, la: np.ndarray, rho: np.ndarray, max_goals: int =
     return np.stack([m[:, i > j].sum(1), m[:, i == j].sum(1), m[:, i < j].sum(1)], 1)
 
 
+def over_prob(lh: np.ndarray, la: np.ndarray, rho: np.ndarray, line: float = 2.5, max_goals: int = 10) -> np.ndarray:
+    """P(голов больше line) по матрице счёта Диксона–Коулза (векторизованно)."""
+    g = np.arange(max_goals + 1)
+    m = poisson.pmf(g[None, :], lh[:, None])[:, :, None] * poisson.pmf(g[None, :], la[:, None])[:, None, :]
+    m[:, 0, 0] *= np.clip(1 - lh * la * rho, 1e-6, None)
+    m[:, 0, 1] *= np.clip(1 + lh * rho, 1e-6, None)
+    m[:, 1, 0] *= np.clip(1 + la * rho, 1e-6, None)
+    m[:, 1, 1] *= np.clip(1 - rho, 1e-6, None)
+    m /= m.sum((1, 2), keepdims=True)
+    i, j = np.indices(m.shape[1:])
+    return m[:, (i + j) > line].sum(1)
+
+
 def rho_of(X: pd.DataFrame) -> np.ndarray:
     return X["dc_rho"].fillna(DEFAULT_RHO).to_numpy(float)
 
@@ -236,6 +249,10 @@ class MatchPredictor:
     def predict_goals(self, X: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
         M = self._matrix(X)
         return self.reg_h.predict(M), self.reg_a.predict(M)
+
+    def predict_over(self, X: pd.DataFrame, line: float = 2.5) -> np.ndarray:
+        lh, la = self.predict_goals(X)
+        return over_prob(lh, la, rho_of(X), line)
 
     def feature_importance(self, top: int = 20) -> pd.Series:
         imp = pd.Series(self.clf.feature_importance("gain"), index=self.clf.feature_name())

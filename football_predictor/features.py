@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from .data import season_of
+from .data import LEAGUE_INFO, season_of
 from .dixon_coles import DixonColes
 
 # lval — log стоимости вышедшего состава (Transfermarkt), остальное — «за/против» в матче
@@ -44,6 +44,7 @@ class TeamState:
     n_league: int = 0          # матчей в лиге за всё время
     n_season: int = 0
     new_in_league: bool = True
+    came_from: int = 0          # в первом сезоне в лиге: +1 вылетел сверху, −1 поднялся снизу, 0 — неизвестно
     form: dict = field(default_factory=dict)  # (stat, speed) -> EWMA
     manager: str | None = None  # тренер в последнем матче
     manager_n: int = 0          # матчей подряд с этим тренером
@@ -71,18 +72,34 @@ class FeatureEngine:
         return [s for (lg, _), s in self.teams.items()
                 if lg == league and s.last_date is not None and (date - s.last_date).days < 365]
 
+    def _came_from(self, league: str, name: str, date: pd.Timestamp) -> int:
+        """Откуда пришла команда: +1 — из дивизиона выше (вылет), −1 — снизу (повышение), 0 — не знаем."""
+        country, tier = LEAGUE_INFO.get(league, (None, None))
+        if country is None:
+            return 0
+        best = None
+        for other, (c, t) in LEAGUE_INFO.items():
+            st = self.teams.get((other, name)) if other != league and c == country else None
+            if st is not None and st.last_date is not None and (date - st.last_date).days < 400:
+                if best is None or st.last_date > best[0]:
+                    best = (st.last_date, t)
+        return 0 if best is None else (1 if best[1] < tier else -1)
+
     def _team(self, league: str, name: str, date: pd.Timestamp, season: int) -> TeamState:
         key = (league, name)
         st = self.teams.get(key)
         if st is None:
             others = self._league_teams(league, date)
-            if len(others) >= 10:  # новичок лиги (как правило, промоутер) — слабее среднего
-                elo = float(np.quantile([o.elo for o in others], 0.15))
-                pih = float(np.quantile([o.pi_home for o in others], 0.15))
-                pia = float(np.quantile([o.pi_away for o in others], 0.15))
+            came = self._came_from(league, name, date)
+            # вылетевший из дивизиона выше обычно один из сильнейших, поднявшийся — слабее среднего
+            q = 0.8 if came > 0 else 0.15
+            if len(others) >= 10:
+                elo = float(np.quantile([o.elo for o in others], q))
+                pih = float(np.quantile([o.pi_home for o in others], q))
+                pia = float(np.quantile([o.pi_away for o in others], q))
             else:
                 elo, pih, pia = 1500.0, 0.0, 0.0
-            st = TeamState(elo=elo, pi_home=pih, pi_away=pia, season=season)
+            st = TeamState(elo=elo, pi_home=pih, pi_away=pia, season=season, came_from=came)
             self.teams[key] = st
         elif st.season != season:
             # новый сезон: откат Elo к среднему; вернувшийся после вылета — снова «новичок»
@@ -91,8 +108,11 @@ class FeatureEngine:
                 mean_elo = float(np.mean([o.elo for o in others]))
                 st.elo = st.elo * (1 - self.elo_revert) + mean_elo * self.elo_revert
             st.new_in_league = st.last_date is not None and (date - st.last_date).days > 150
+            st.came_from = self._came_from(league, name, date) if st.new_in_league else 0
             if st.new_in_league and len(others) >= 10:
-                st.elo = min(st.elo, float(np.quantile([o.elo for o in others], 0.3)))
+                elos = [o.elo for o in others]
+                st.elo = (max(st.elo, float(np.quantile(elos, 0.7))) if st.came_from > 0
+                          else min(st.elo, float(np.quantile(elos, 0.3))))
             st.season, st.n_season = season, 0
         return st
 
@@ -142,12 +162,13 @@ class FeatureEngine:
 
         dc = self.dc.get(league)
         if dc is not None:
-            p = dc.predict(home, away)
+            qh, qa = (0.8 if getattr(t, "came_from", 0) > 0 else 0.2 for t in (h, a))
+            p = dc.predict(home, away, qh, qa)
             f.update(dc_p_home=p["p_home"], dc_p_draw=p["p_draw"], dc_p_away=p["p_away"],
                      dc_lambda_h=p["lambda_home"], dc_lambda_a=p["lambda_away"],
                      dc_over_2_5=p["over_2_5"], dc_btts=p["btts"], dc_rho=dc.rho, dc_home_adv=dc.params[-1])
-            ah, dh = dc.team_strength(home)
-            aa, da = dc.team_strength(away)
+            ah, dh = dc.team_strength(home, qh)
+            aa, da = dc.team_strength(away, qa)
             f.update(dc_att_h=ah, dc_def_h=dh, dc_att_a=aa, dc_def_a=da)
         else:
             for k in ["dc_p_home", "dc_p_draw", "dc_p_away", "dc_lambda_h", "dc_lambda_a",
@@ -172,6 +193,7 @@ class FeatureEngine:
             f[f"{side}_n_league"] = min(st.n_league, 400)
             f[f"{side}_n_season"] = st.n_season
             f[f"{side}_new"] = float(st.new_in_league)
+            f[f"{side}_from"] = float(getattr(st, "came_from", 0))
             mgr = getattr(st, "manager", None)  # getattr: движки, сохранённые до появления тренеров
             f[f"{side}_mgr_n"] = min(st.manager_n, 100) if mgr else np.nan
         for stat in ["gf", "ga", "xgf", "xga", "stf", "sta", "pts", "lval"]:

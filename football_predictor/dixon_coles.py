@@ -126,14 +126,15 @@ class DixonColes:
             return att[k], dfn[k]
         return float(np.quantile(att, newcomer_q)), float(np.quantile(dfn, 1 - newcomer_q))
 
-    def predict_lambdas(self, home: str, away: str) -> tuple[float, float]:
-        ah, dh = self.team_strength(home)
-        aa, da = self.team_strength(away)
+    def predict_lambdas(self, home: str, away: str, q_home: float = 0.2, q_away: float = 0.2) -> tuple[float, float]:
+        """q_* — квантиль силы для команды, которой нет в выборке (новичок лиги)."""
+        ah, dh = self.team_strength(home, q_home)
+        aa, da = self.team_strength(away, q_away)
         mu, h = self.params[-2], self.params[-1]
         return float(np.exp(mu + h + ah + da)), float(np.exp(mu + aa + dh))
 
-    def predict(self, home: str, away: str) -> dict:
-        lh, la = self.predict_lambdas(home, away)
+    def predict(self, home: str, away: str, q_home: float = 0.2, q_away: float = 0.2) -> dict:
+        lh, la = self.predict_lambdas(home, away, q_home, q_away)
         out = markets(score_matrix(lh, la, self.rho))
         out.update(lambda_home=lh, lambda_away=la)
         return out

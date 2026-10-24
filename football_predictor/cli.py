@@ -43,16 +43,20 @@ def _load_features(args):
 
 def _filter(matches, X, args):
     mask = matches["season"] >= args.train_from
-    if args.leagues:
-        mask &= matches["league"].isin(args.leagues)
+    # по умолчанию — топ-5 лиг (на них рассчитаны сайт и API); --leagues all — все скачанные
+    leagues = args.leagues or data.LEAGUES
+    if leagues != ["all"]:
+        mask &= matches["league"].isin(leagues)
     return matches[mask], X[mask]
 
 
 def cmd_download(args):
-    data.download(args.leagues or data.LEAGUES, args.first, args.last, args.data_dir, args.force)
-    if not args.no_xg:
+    leagues = data.ALL_LEAGUES if args.leagues == ["all"] else (args.leagues or data.LEAGUES)
+    data.download(leagues, args.first, args.last, args.data_dir, args.force)
+    top = [lg for lg in leagues if lg in understat.LEAGUE_CODES]  # xG у Understat только для топ-5
+    if top and not args.no_xg:
         print("xG с understat.com...")
-        understat.download(args.leagues or data.LEAGUES, force=args.force)
+        understat.download(top, force=args.force)
     if not args.no_tm:
         print("Составы и стоимость игроков (transfermarkt-datasets)...")
         transfermarkt.download(force=args.force)
@@ -198,7 +202,7 @@ def main(argv=None):
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--data-dir", default="data/raw")
     common.add_argument("--extra-csv", nargs="+", help="доп. CSV в формате football-data.co.uk (можно с коэффициентами)")
-    common.add_argument("--leagues", nargs="+", help=f"подмножество лиг: {' '.join(data.LEAGUES)}")
+    common.add_argument("--leagues", nargs="+", help="лиги (по умолчанию топ-5; all — все скачанные): " + " ".join(data.ALL_LEAGUES))
     common.add_argument("--rebuild", action="store_true", help="пересчитать кэш признаков")
     common.add_argument("--no-market", action="store_true",
                         help="не использовать коэффициенты как признаки (чистая модель против рынка)")

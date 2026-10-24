@@ -20,10 +20,25 @@ MIRROR_URL = "https://raw.githubusercontent.com/datasets/football-datasets/main/
 
 LEAGUES = ["premier-league", "la-liga", "serie-a", "bundesliga", "ligue-1"]
 
-# Коды дивизионов football-data.co.uk
-DIV_TO_LEAGUE = {"E0": "premier-league", "SP1": "la-liga", "I1": "serie-a",
-                 "D1": "bundesliga", "F1": "ligue-1"}
+# Все дивизионы football-data.co.uk, которые мы умеем качать: код -> (наше имя, страна, уровень).
+# Страна и уровень нужны, чтобы вылетевшие/поднявшиеся команды не начинали «с нуля».
+DIVISIONS = {
+    "E0": ("premier-league", "england", 1), "E1": ("championship", "england", 2),
+    "E2": ("league-one", "england", 3), "E3": ("league-two", "england", 4),
+    "EC": ("national-league", "england", 5),
+    "SP1": ("la-liga", "spain", 1), "SP2": ("segunda", "spain", 2),
+    "I1": ("serie-a", "italy", 1), "I2": ("serie-b", "italy", 2),
+    "D1": ("bundesliga", "germany", 1), "D2": ("bundesliga-2", "germany", 2),
+    "F1": ("ligue-1", "france", 1), "F2": ("ligue-2", "france", 2),
+    "SC0": ("scottish-premiership", "scotland", 1), "SC1": ("scottish-championship", "scotland", 2),
+    "N1": ("eredivisie", "netherlands", 1), "B1": ("jupiler-league", "belgium", 1),
+    "P1": ("primeira-liga", "portugal", 1), "T1": ("super-lig", "turkey", 1), "G1": ("super-league-greece", "greece", 1),
+}
+DIV_TO_LEAGUE = {div: name for div, (name, _, _) in DIVISIONS.items()}
 LEAGUE_TO_DIV = {v: k for k, v in DIV_TO_LEAGUE.items()}
+LEAGUE_INFO = {name: (country, tier) for name, country, tier in DIVISIONS.values()}  # имя -> (страна, уровень)
+ALL_LEAGUES = list(LEAGUE_TO_DIV)
+OTHER_LEAGUES = [lg for lg in ALL_LEAGUES if lg not in LEAGUES]
 
 FIRST_SEASON = 1993
 
@@ -63,7 +78,8 @@ def download(leagues=LEAGUES, first=FIRST_SEASON, last=LAST_SEASON,
             path = cache / f"{league}_{code}.csv"
             if path.exists() and not force and year < current:
                 continue
-            for url in (f"{FD_URL}/{code}/{div}.csv", f"{MIRROR_URL}/{league}/season-{code}.csv"):
+            urls = [f"{FD_URL}/{code}/{div}.csv"] + ([f"{MIRROR_URL}/{league}/season-{code}.csv"] if league in LEAGUES else [])
+            for url in urls:
                 try:
                     path.write_bytes(_fetch(url))
                     print(f"  {league} {code} <- {url.split('/')[2]}")
